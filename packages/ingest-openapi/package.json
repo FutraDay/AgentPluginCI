@@ -1,17 +1,18 @@
 {
-  "name": "@agent-plugin-ci/cli",
+  "name": "@agent-plugin-ci/ingest-openapi",
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "exports": "./src/index.ts",
   "dependencies": {
-    "@agent-plugin-ci/compiler": "workspace:*",
-    "@agent-plugin-ci/ingest-mcp": "workspace:*",
-    "@agent-plugin-ci/ingest-openapi": "workspace:*",
     "@agent-plugin-ci/plugin-ir": "workspace:*",
+    "yaml": "2.9.0"
+  },
+  "devDependencies": {
+    "@agent-plugin-ci/compiler": "workspace:*",
     "@agent-plugin-ci/validator": "workspace:*"
   },
   "scripts": {
-    "start": "tsx src/index.ts",
     "build": "tsc -p tsconfig.json --noEmit",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run --passWithNoTests"

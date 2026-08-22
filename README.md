@@ -4,21 +4,27 @@ Compiler, validator and compatibility infrastructure for portable Agent Plugins.
 
 ## Current phase
 
-Phase 2A adds real MCP source ingestion while preserving the Phase 1 compiler core:
+Phase 2B adds OpenAPI ingestion while preserving the Phase 2A MCP pipeline and Phase 1 compiler core:
 
 - stable internal `PluginIR`
-- generic discovered capability representation
-- isolated `@agent-plugin-ci/ingest-mcp` package
-- MCP configuration normalization
-- MCP SDK v2 tool discovery over stdio, Streamable HTTP and SSE
-- deterministic tool-to-skill generation
-- untrusted-input limits and metadata sanitization
-- secure discovery defaults for stdio, private networks and insecure HTTP
-- MCP source support in the CLI
+- generic MCP and HTTP-operation capability representation
+- isolated `@agent-plugin-ci/ingest-openapi` package
+- OpenAPI 3.0, 3.1 and 3.2 JSON/YAML loading
+- local and remote OpenAPI source loading
+- bounded internal and external `$ref` resolution
+- parameter and request-body normalization into `PluginIR`
+- OpenAPI 3.2 `QUERY`, `querystring` and `additionalOperations` support
+- deterministic operation-to-skill generation
+- document, schema, reference and operation limits
+- secure defaults for private networks, insecure HTTP, cross-origin refs and file refs outside the source root
+- OpenAPI source support in the CLI
+- existing MCP ingestion and compiler behavior preserved
 
-The pipeline remains:
+The source pipelines remain:
 
 `MCP source -> PluginIR -> Compiler -> plugin.json / mcp.json / SKILL.md -> Validator`
+
+`OpenAPI source -> PluginIR -> Compiler -> plugin.json / SKILL.md -> Validator`
 
 ## Verify
 
@@ -41,7 +47,7 @@ pnpm cli
 Build from an MCP configuration and explicitly allow stdio discovery:
 
 ```powershell
-pnpm cli -- --mcp fixtures/mcp/stdio.json --allow-stdio-discovery --name mcp-phase2a-e2e --out dist/mcp-phase2a-e2e
+pnpm cli -- --mcp fixtures/mcp/stdio.json --allow-stdio-discovery --name mcp-example
 ```
 
 Build from a remote MCP URL without capability discovery:
@@ -50,4 +56,11 @@ Build from a remote MCP URL without capability discovery:
 pnpm cli -- --mcp https://example.com/mcp --no-discover --name example-plugin
 ```
 
-Stdio execution, private-network discovery and insecure HTTP discovery require explicit opt-in flags.
+Build from a local OpenAPI JSON or YAML document:
+
+```powershell
+pnpm cli -- --openapi fixtures/openapi/support.yaml --name support-api
+pnpm cli -- --openapi fixtures/openapi/search.json --name search-api
+```
+
+Remote OpenAPI URLs use HTTPS and public-network targets by default. Private-network access, insecure HTTP, cross-origin `$ref` loading and external file refs outside the source root require explicit opt-in flags.

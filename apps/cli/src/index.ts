@@ -3,6 +3,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { compilePlugin } from "@agent-plugin-ci/compiler";
 import { createSdkMcpToolDiscoverer, ingestMcpConfig, mcpConfigFromUrl } from "@agent-plugin-ci/ingest-mcp";
+import { ingestOpenApiSource } from "@agent-plugin-ci/ingest-openapi";
 import type { PluginIR } from "@agent-plugin-ci/plugin-ir";
 import { validateCompiledPlugin } from "@agent-plugin-ci/validator";
 
@@ -11,13 +12,30 @@ const invocationRoot = resolve(process.env.INIT_CWD ?? process.cwd());
 process.chdir(invocationRoot);
 const args = process.argv.slice(2);
 const mcpIndex = args.indexOf("--mcp");
+const openApiIndex = args.indexOf("--openapi");
+if (mcpIndex >= 0 && openApiIndex >= 0) throw new Error("--mcp and --openapi are mutually exclusive");
 
 let ir: PluginIR;
 let outDir: string;
 
-if (mcpIndex >= 0) {
-  const source = args[mcpIndex + 1];
-  if (!source || source.startsWith("--")) throw new Error("--mcp requires a configuration path or MCP URL");
+if (openApiIndex >= 0) {
+  const source = requiredOptionSource(args, openApiIndex, "--openapi", "an OpenAPI JSON/YAML path or URL");
+  const pluginName = optionValue(args, "--name");
+  const out = optionValue(args, "--out");
+  const result = await ingestOpenApiSource(source, {
+    pluginName,
+    allowPrivateNetwork: args.includes("--allow-private-network"),
+    allowInsecureHttp: args.includes("--allow-insecure-http"),
+    allowCrossOriginRefs: args.includes("--allow-cross-origin-refs"),
+    allowExternalFileRefsOutsideRoot: args.includes("--allow-external-file-refs")
+  });
+  ir = result.ir;
+  outDir = resolve(out ?? join(repoRoot, "dist", ir.identity.name));
+  for (const warning of result.warnings) {
+    console.warn(`WARNING ${warning.code}${warning.operation ? ` [${warning.operation}]` : ""}: ${warning.message}`);
+  }
+} else if (mcpIndex >= 0) {
+  const source = requiredOptionSource(args, mcpIndex, "--mcp", "a configuration path or MCP URL");
   const pluginName = optionValue(args, "--name");
   const out = optionValue(args, "--out");
   const discover = !args.includes("--no-discover");
@@ -58,6 +76,7 @@ console.log(`BUILD_OK ${outDir}`);
 console.log(`PLUGIN ${String(compiled.manifest.name)}`);
 console.log(`SKILLS ${Object.keys(compiled.skills).length}`);
 console.log(`MCP_SERVERS ${ir.mcpServers.length}`);
+console.log(`CAPABILITIES ${ir.capabilities?.length ?? 0}`);
 console.log("AGENT_PLUGINS_1_0_VALIDATION_PASS");
 
 async function readMcpConfig(path: string): Promise<unknown> {
@@ -65,6 +84,12 @@ async function readMcpConfig(path: string): Promise<unknown> {
   const info = await stat(absolute);
   if (info.size > 1_000_000) throw new Error("MCP configuration exceeds 1 MB safety limit");
   return JSON.parse(await readFile(absolute, "utf8")) as unknown;
+}
+
+function requiredOptionSource(values: string[], index: number, name: string, description: string): string {
+  const value = values[index + 1];
+  if (!value || value.startsWith("--")) throw new Error(`${name} requires ${description}`);
+  return value;
 }
 
 function optionValue(values: string[], name: string): string | undefined {

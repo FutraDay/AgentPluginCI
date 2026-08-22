@@ -1,0 +1,44 @@
+{
+  "openapi": "3.2.0",
+  "info": {
+    "title": "Search API",
+    "version": "2.0.0"
+  },
+  "paths": {
+    "/items": {
+      "query": {
+        "operationId": "queryItems",
+        "summary": "Query items",
+        "parameters": [
+          {
+            "name": "selector",
+            "in": "querystring",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      },
+      "additionalOperations": {
+        "COPY": {
+          "operationId": "copyItems",
+          "summary": "Copy items",
+          "responses": {
+            "200": {
+              "description": "ok"
+            }
+          }
+        }
+      }
+    }
+  }
+}
