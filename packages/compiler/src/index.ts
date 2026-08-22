@@ -20,7 +20,7 @@ export function compilePlugin(ir: PluginIR): CompiledPlugin {
   if (ir.identity.authorName) manifest.author = { name: ir.identity.authorName };
   if (ir.extensions) manifest.extensions = ir.extensions;
 
-  const skills = Object.fromEntries(ir.skills.map((skill) => [skill.name, `---\nname: ${skill.name}\ndescription: ${skill.description}\n---\n\n${skill.instructions.trim()}\n`]));
+  const skills = Object.fromEntries(ir.skills.map((skill) => [skill.name, `---\nname: ${JSON.stringify(skill.name)}\ndescription: ${JSON.stringify(skill.description)}\n---\n\n${skill.instructions.trim()}\n`]));
 
   const mcpServers = Object.fromEntries(ir.mcpServers.map((server) => {
     if (server.transport === "stdio") {

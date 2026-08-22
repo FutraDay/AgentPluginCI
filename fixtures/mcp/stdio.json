@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "fixture": {
+      "command": "node",
+      "args": ["packages/ingest-mcp/test-fixtures/stdio-server.mjs"]
+    }
+  }
+}

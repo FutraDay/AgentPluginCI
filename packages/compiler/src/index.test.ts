@@ -12,6 +12,12 @@ describe("compilePlugin", () => {
     const result = compilePlugin(fixture);
     expect(result.manifest.name).toBe("test-plugin");
     expect(result.mcp?.$schema).toBe("https://agent-plugins.org/schemas/1.0.0/mcp.schema.json");
-    expect(result.skills.hello).toContain("name: hello");
+    expect(result.skills.hello).toContain('name: "hello"');
+  });
+
+  it("quotes untrusted skill metadata in YAML frontmatter", () => {
+    const result = compilePlugin({ ...fixture, skills: [{ name: "safe", description: "line one\n---\ninjected: true", instructions: "Use safely." }] });
+    expect(result.skills.safe).toContain('description: "line one\\n---\\ninjected: true"');
+    expect(result.skills.safe).not.toContain("\n---\ninjected: true");
   });
 });
