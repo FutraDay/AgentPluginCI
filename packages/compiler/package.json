@@ -1,0 +1,16 @@
+{
+  "name": "@agent-plugin-ci/compiler",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@agent-plugin-ci/plugin-ir": "workspace:*",
+    "@agent-plugin-ci/spec-agent-plugins-v1": "workspace:*"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests"
+  }
+}

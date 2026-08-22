@@ -1,0 +1,21 @@
+{
+  "identity": {
+    "name": "hello-plugin",
+    "version": "0.1.0",
+    "description": "Reference fixture for Agent Plugin CI"
+  },
+  "skills": [
+    {
+      "name": "greet",
+      "description": "Greet the user and offer help.",
+      "instructions": "Greet the user briefly, then ask what they need help with."
+    }
+  ],
+  "mcpServers": [
+    {
+      "name": "example-api",
+      "transport": "streamable-http",
+      "url": "https://example.com/mcp"
+    }
+  ]
+}
