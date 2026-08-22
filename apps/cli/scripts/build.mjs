@@ -13,7 +13,7 @@ await build({
   bundle: true,
   platform: "node",
   format: "cjs",
-  target: "node20",
+  target: "node22",
   banner: { js: "#!/usr/bin/env node" },
   legalComments: "eof",
   sourcemap: false

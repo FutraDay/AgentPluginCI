@@ -29,7 +29,7 @@ Markdown/docs/repository ingestion, compatibility matrices, certification, hoste
 
 Requirements:
 
-- Node.js 20+
+- Node.js 22.13+
 - pnpm 11.2.2 for repository development
 
 From the repository:
