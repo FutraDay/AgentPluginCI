@@ -13,6 +13,7 @@
     "@agent-plugin-ci/ingest-mcp": "workspace:*",
     "@agent-plugin-ci/ingest-openapi": "workspace:*",
     "@agent-plugin-ci/plugin-ir": "workspace:*",
+    "@agent-plugin-ci/security": "workspace:*",
     "@agent-plugin-ci/validator": "workspace:*",
     "esbuild": "^0.28.2"
   },

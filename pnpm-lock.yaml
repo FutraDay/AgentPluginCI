@@ -35,6 +35,9 @@ importers:
       '@agent-plugin-ci/plugin-ir':
         specifier: workspace:*
         version: link:../../packages/plugin-ir
+      '@agent-plugin-ci/security':
+        specifier: workspace:*
+        version: link:../../packages/security
       '@agent-plugin-ci/validator':
         specifier: workspace:*
         version: link:../../packages/validator
@@ -87,6 +90,8 @@ importers:
         version: link:../validator
 
   packages/plugin-ir: {}
+
+  packages/security: {}
 
   packages/spec-agent-plugins-v1: {}
 

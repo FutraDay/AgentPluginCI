@@ -6,7 +6,7 @@ Agent Plugin CI builds and validates portable Agent Plugins from real integratio
 
 The core architecture is intentionally fixed:
 
-`Source -> PluginIR -> Compiler -> Validator -> Package`
+`Source -> PluginIR -> Compiler -> Validator -> Security Scan -> Package`
 
 No source ingestion path compiles directly into `plugin.json`.
 
@@ -19,6 +19,7 @@ No source ingestion path compiles directly into `plugin.json`.
 - deterministic skill generation from discovered capabilities
 - `plugin.json`, optional `mcp.json`, and `skills/*/SKILL.md` output
 - package validation from the CLI
+- deterministic package security scanning with stable findings and CI severity policy
 - machine-readable JSON results for CI
 - bundled npm CLI package
 - GitHub CI and tagged release packaging
@@ -49,6 +50,8 @@ agentplugin --version
 ```
 
 The installed executable name is `agentplugin`.
+
+The published npm `0.1.0` package predates Phase 2I security scanning. The `scan` command documented below is currently available from the repository build and will ship with a subsequent published CLI release.
 
 ## Build from MCP
 
@@ -87,13 +90,26 @@ node apps/cli/dist/index.cjs validate dist/support-api
 
 Validation accepts either a package directory or its `plugin.json` path. Exit code `0` means valid; exit code `1` means the package, input, build, or security check failed; exit code `2` means the CLI invocation itself is invalid.
 
+## Scan package security
+
+Security scanning is deliberately separate from schema validation. It does not execute plugin code or MCP servers.
+
+```powershell
+node apps/cli/dist/index.cjs scan dist/support-api
+node apps/cli/dist/index.cjs scan dist/support-api --fail-on medium
+node apps/cli/dist/index.cjs scan dist/support-api --fail-on none --json
+```
+
+The default policy fails on `high` or `critical` findings. `--fail-on none` keeps the scan report-only. Findings include stable IDs, severity, location, redacted evidence, and remediation guidance. Builds also run an in-memory report-only scan so new security findings are surfaced without changing existing build success semantics.
+
 ## Machine-readable CI output
 
-Add `--json` to `build` or `validate` to emit one JSON object on stdout.
+Add `--json` to `build`, `validate`, or `scan` to emit one JSON object on stdout.
 
 ```powershell
 node apps/cli/dist/index.cjs build --openapi fixtures/openapi/search.json --name search-api --out dist/search-api --json
 node apps/cli/dist/index.cjs validate dist/search-api --json
+node apps/cli/dist/index.cjs scan dist/search-api --json
 ```
 
 ## Output structure
@@ -124,6 +140,8 @@ Imported sources are untrusted. v0.1 keeps these behaviors deny-by-default:
 - unsafe schema keys and excessive nesting where implemented by ingestion packages
 
 Inline MCP environment values are normalized to environment-variable placeholders rather than copied into generated `mcp.json`.
+
+The Phase 2I scanner additionally checks package content without executing it, including embedded credentials, dangerous MCP launchers and inline execution, unsafe paths and working directories, execution-control environment variables, credential/routing-sensitive headers, private or metadata-service endpoints, symlinks, case-insensitive path collisions, sensitive local artifacts, executable content, and bounded filesystem/object traversal. Scan-limit or structured-analysis failures are reported explicitly rather than treated as clean results.
 
 Use the `--allow-*` flags only for sources you trust and only when the target workflow requires them.
 ## Development verification

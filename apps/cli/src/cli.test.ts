@@ -20,7 +20,11 @@ describe("Agent Plugin CI CLI", () => {
     const cap = capture();
     const code = await runCli(["build", "--openapi", join(repoRoot, "fixtures/openapi/support.yaml"), "--out", out, "--json"], { cwd, ...cap.io });
     expect(code).toBe(0);
-    expect(JSON.parse(cap.stdout[0]!).ok).toBe(true);
+    const buildResult = JSON.parse(cap.stdout[0]!);
+    expect(buildResult.ok).toBe(true);
+    expect(buildResult.security.mode).toBe("report-only");
+    expect(buildResult.security.complete).toBe(true);
+    expect(buildResult.security.summary.total).toBe(0);
     expect(JSON.parse(await readFile(join(out, "plugin.json"), "utf8")).name).toBeTruthy();
     const validation = capture();
     expect(await runCli(["validate", out, "--json"], { cwd, ...validation.io })).toBe(0);
@@ -140,6 +144,91 @@ describe("Agent Plugin CI CLI", () => {
     expect(code).toBe(1);
     expect(JSON.parse(cap.stdout[0]!).error.code).toBe("OUTPUT_UNSAFE");
     expect(await stat(join(cwd, "escape")).catch(() => undefined)).toBeUndefined();
+  });
+
+  it("reports build-time security findings without changing build success policy", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-security-build-"));
+    const input = join(cwd, "security-ir.json");
+    const secret = "literal-build-secret";
+    const ir = {
+      identity: { name: "security-build" },
+      skills: [],
+      mcpServers: [{ name: "local", transport: "stdio", command: "node", env: { API_KEY: secret } }]
+    };
+    await writeFile(input, JSON.stringify(ir), "utf8");
+    const cap = capture();
+    const code = await runCli(["build", "--ir", input, "--out", join(cwd, "out"), "--json"], { cwd, ...cap.io });
+    expect(code).toBe(0);
+    const result = JSON.parse(cap.stdout[0]!);
+    expect(result.security.mode).toBe("report-only");
+    expect(result.security.findings.some((finding: { id: string }) => finding.id === "APCI-SEC-001")).toBe(true);
+    expect(cap.stdout[0]).not.toContain(secret);
+  });
+
+  it("fails the scan command on high-severity findings by default", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-security-cli-"));
+    await writeFile(join(cwd, "plugin.json"), JSON.stringify({ name: "unsafe" }), "utf8");
+    await writeFile(join(cwd, "mcp.json"), JSON.stringify({
+      mcpServers: { remote: { type: "streamable-http", url: "https://example.com/mcp", headers: { Authorization: "Bearer fixed-secret" } } }
+    }), "utf8");
+    const cap = capture();
+    const code = await runCli(["scan", cwd, "--json"], { cwd, ...cap.io });
+    expect(code).toBe(1);
+    const result = JSON.parse(cap.stdout[0]!);
+    expect(result.ok).toBe(false);
+    expect(result.policy.failOn).toBe("high");
+    expect(result.findings.some((finding: { id: string }) => finding.id === "APCI-SEC-008")).toBe(true);
+    expect(cap.stdout[0]).not.toContain("fixed-secret");
+  });
+
+  it("supports report-only and custom severity policies for security scans", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-security-policy-"));
+    await writeFile(join(cwd, "plugin.json"), JSON.stringify({ name: "private" }), "utf8");
+    await writeFile(join(cwd, "mcp.json"), JSON.stringify({
+      mcpServers: { local: { type: "streamable-http", url: "https://127.0.0.1/mcp" } }
+    }), "utf8");
+
+    const critical = capture();
+    expect(await runCli(["scan", cwd, "--fail-on", "critical", "--json"], { cwd, ...critical.io })).toBe(0);
+    expect(JSON.parse(critical.stdout[0]!).summary.medium).toBeGreaterThan(0);
+
+    const medium = capture();
+    expect(await runCli(["scan", cwd, "--fail-on", "medium", "--json"], { cwd, ...medium.io })).toBe(1);
+
+    const reportOnly = capture();
+    expect(await runCli(["scan", cwd, "--fail-on", "none", "--json"], { cwd, ...reportOnly.io })).toBe(0);
+  });
+
+  it("fails closed on incomplete scans even above the finding severity", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-security-incomplete-"));
+    await writeFile(join(cwd, "plugin.json"), "{not-json", "utf8");
+    const cap = capture();
+    const code = await runCli(["scan", cwd, "--fail-on", "critical", "--json"], { cwd, ...cap.io });
+    expect(code).toBe(1);
+    const result = JSON.parse(cap.stdout[0]!);
+    expect(result.complete).toBe(false);
+    expect(result.blockingFindings).toBe(0);
+    expect(result.incompleteScanBlocked).toBe(true);
+  });
+
+  it("escapes control characters in human-readable security findings", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-security-console-"));
+    await writeFile(join(cwd, "plugin.json"), JSON.stringify({ name: "unsafe" }), "utf8");
+    await writeFile(join(cwd, "mcp.json"), JSON.stringify({
+      mcpServers: { local: { type: "stdio", command: "node", env: { "API_KEY\nINJECTED": "literal-value" } } }
+    }), "utf8");
+    const cap = capture();
+    const code = await runCli(["scan", cwd], { cwd, ...cap.io });
+    expect(code).toBe(1);
+    expect(cap.stderr.some((message) => message.includes("\\u000a"))).toBe(true);
+    expect(cap.stderr.every((message) => !message.includes("\n"))).toBe(true);
+  });
+
+  it("rejects invalid security scan severity usage", async () => {
+    const cap = capture();
+    const code = await runCli(["scan", ".", "--fail-on", "severe", "--json"], cap.io);
+    expect(code).toBe(2);
+    expect(JSON.parse(cap.stdout[0]!).error.code).toBe("USAGE_ERROR");
   });
 
 });

@@ -4,6 +4,13 @@ import { compilePlugin, type CompiledPlugin } from "@agent-plugin-ci/compiler";
 import { createSdkMcpToolDiscoverer, ingestMcpConfig, mcpConfigFromUrl } from "@agent-plugin-ci/ingest-mcp";
 import { ingestOpenApiSource } from "@agent-plugin-ci/ingest-openapi";
 import type { PluginIR } from "@agent-plugin-ci/plugin-ir";
+import {
+  scanPackageSecurity,
+  scanPluginSecurity,
+  severityAtLeast,
+  type SecurityScanResult,
+  type SecuritySeverity
+} from "@agent-plugin-ci/security";
 import { validateCompiledPlugin, type ValidationResult } from "@agent-plugin-ci/validator";
 import cliPackage from "../package.json" with { type: "json" };
 
@@ -17,6 +24,7 @@ export interface CliIo {
 }
 
 type SourceKind = "mcp" | "openapi" | "ir";
+type ScanThreshold = SecuritySeverity | "none";
 type Warning = { code: string; message: string; scope?: string };
 
 type ParsedBuildOptions = {
@@ -57,6 +65,7 @@ export async function runCli(rawArgs: string[], io: CliIo = {}): Promise<number>
     const args = normalizeLegacyArgs(rawArgs);
     if (args[0] === "build") return await runBuild(args.slice(1), cwd, stdout, stderr);
     if (args[0] === "validate") return await runValidate(args.slice(1), cwd, stdout, stderr);
+    if (args[0] === "scan") return await runScan(args.slice(1), cwd, stdout, stderr);
     throw new CliError(`Unknown command: ${args[0]}`, "USAGE_ERROR", 2);
   } catch (error) {
     return renderFailure(error, json, stdout, stderr);
@@ -110,6 +119,11 @@ async function runBuild(
   const compiled = compilePlugin(ir);
   const validation = validateCompiledPlugin(compiled.manifest, compiled.mcp);
   if (!validation.ok) return renderValidationFailure(validation, options.json, stdout, stderr);
+  const security = scanPluginSecurity({
+    manifest: compiled.manifest,
+    mcp: compiled.mcp,
+    skills: compiled.skills
+  });
 
   const outDir = resolve(cwd, options.out ?? join("dist", ir.identity.name));
   await writeCompiledPackage(compiled, outDir, cwd, options.force);
@@ -125,6 +139,7 @@ async function runBuild(
       mcpServers: ir.mcpServers.length,
       capabilities: ir.capabilities?.length ?? 0
     },
+    security: { mode: "report-only" as const, ...security },
     warnings: [...warnings, ...validation.warnings.map((message) => ({ code: "VALIDATION_WARNING", message }))]
   };
 
@@ -170,6 +185,41 @@ async function runValidate(
     for (const error of result.errors) stderr(`- ${error}`);
   }
   return result.ok ? 0 : 1;
+}
+
+async function runScan(
+  args: string[],
+  cwd: string,
+  stdout: (message: string) => void,
+  stderr: (message: string) => void
+): Promise<number> {
+  const { target, json, failOn } = parseScanArgs(args);
+  const resolved = resolve(cwd, target);
+  const info = await stat(resolved).catch(() => undefined);
+  if (!info) throw new CliError(`Security scan target not found: ${target}`, "SECURITY_INPUT_ERROR");
+  const packageDir = info.isDirectory() ? resolved : dirname(resolved);
+  const result = await scanPackageSecurity(packageDir);
+  const blocking = failOn === "none"
+    ? []
+    : result.findings.filter((finding) => severityAtLeast(finding.severity, failOn));
+  const incompleteScanBlocked = failOn !== "none" && !result.complete;
+  const ok = failOn === "none" || (!incompleteScanBlocked && blocking.length === 0);
+  const payload = {
+    ok,
+    command: "scan",
+    version: CLI_VERSION,
+    target: packageDir,
+    complete: result.complete,
+    policy: { failOn },
+    summary: result.summary,
+    findings: result.findings,
+    blockingFindings: blocking.length,
+    incompleteScanBlocked
+  };
+
+  if (json) stdout(JSON.stringify(payload));
+  else renderSecurityScan(payload, stdout, stderr);
+  return ok ? 0 : 1;
 }
 
 function parseBuildArgs(args: string[]): ParsedBuildOptions {
@@ -235,6 +285,33 @@ function parseValidateArgs(args: string[]): { target: string; json: boolean } {
   return { target, json };
 }
 
+function parseScanArgs(args: string[]): { target: string; json: boolean; failOn: ScanThreshold } {
+  let target = ".";
+  let seenTarget = false;
+  let json = false;
+  let failOn: ScanThreshold = "high";
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (arg === "--json") {
+      json = true;
+      continue;
+    }
+    if (arg === "--fail-on") {
+      const value = args[++index] as ScanThreshold | undefined;
+      if (!value || !["none", "info", "low", "medium", "high", "critical"].includes(value)) {
+        throw new CliError("--fail-on requires one of: none, info, low, medium, high, critical", "USAGE_ERROR", 2);
+      }
+      failOn = value;
+      continue;
+    }
+    if (arg.startsWith("--")) throw new CliError(`Unknown scan option: ${arg}`, "USAGE_ERROR", 2);
+    if (seenTarget) throw new CliError("scan accepts only one target", "USAGE_ERROR", 2);
+    target = arg;
+    seenTarget = true;
+  }
+  return { target, json, failOn };
+}
+
 function validateSourceSpecificFlags(sourceKind: SourceKind, flags: Set<string>): void {
   const mcpOnly = ["--no-discover", "--allow-stdio-discovery"];
   const openApiOnly = ["--allow-cross-origin-refs", "--allow-external-file-refs"];
@@ -252,7 +329,7 @@ function validateSourceSpecificFlags(sourceKind: SourceKind, flags: Set<string>)
 }
 
 function normalizeLegacyArgs(args: string[]): string[] {
-  if (["build", "validate"].includes(args[0]!)) return args;
+  if (["build", "validate", "scan"].includes(args[0]!)) return args;
   if (args[0]?.startsWith("--")) return ["build", ...args];
   if (args[0]) {
     const [input, maybeOut, ...rest] = args;
@@ -421,7 +498,13 @@ function renderValidationFailure(
 }
 
 function renderBuildSuccess(
-  payload: { outputDir: string; plugin: string; counts: { skills: number; mcpServers: number; capabilities: number }; warnings: Warning[] },
+  payload: {
+    outputDir: string;
+    plugin: string;
+    counts: { skills: number; mcpServers: number; capabilities: number };
+    security: SecurityScanResult & { mode: "report-only" };
+    warnings: Warning[];
+  },
   stdout: (message: string) => void,
   stderr: (message: string) => void
 ): void {
@@ -432,7 +515,42 @@ function renderBuildSuccess(
   stdout(`MCP_SERVERS ${payload.counts.mcpServers}`);
   stdout(`CAPABILITIES ${payload.counts.capabilities}`);
   stdout("AGENT_PLUGINS_1_0_VALIDATION_PASS");
+  if (payload.security.findings.length === 0 && payload.security.complete) {
+    stdout("SECURITY_SCAN_PASS");
+  } else {
+    stdout(`SECURITY_FINDINGS ${payload.security.findings.length} REPORT_ONLY`);
+    for (const finding of payload.security.findings) {
+      stderr(`SECURITY ${finding.severity.toUpperCase()} ${finding.id} [${sanitizeConsoleText(finding.location)}]: ${sanitizeConsoleText(finding.title)}`);
+    }
+  }
 }
+
+function renderSecurityScan(
+  payload: {
+    ok: boolean;
+    target: string;
+    complete: boolean;
+    policy: { failOn: ScanThreshold };
+    summary: SecurityScanResult["summary"];
+    findings: SecurityScanResult["findings"];
+    blockingFindings: number;
+    incompleteScanBlocked: boolean;
+  },
+  stdout: (message: string) => void,
+  stderr: (message: string) => void
+): void {
+  const write = payload.ok ? stdout : stderr;
+  write(`${payload.ok ? "SECURITY_SCAN_OK" : "SECURITY_SCAN_FAILED"} ${sanitizeConsoleText(payload.target)}`);
+  write(`SECURITY_SCAN_COMPLETE ${payload.complete}`);
+  write(`SECURITY_POLICY fail-on=${payload.policy.failOn} blocking=${payload.blockingFindings} incomplete-blocked=${payload.incompleteScanBlocked}`);
+  write(`SECURITY_SUMMARY critical=${payload.summary.critical} high=${payload.summary.high} medium=${payload.summary.medium} low=${payload.summary.low} info=${payload.summary.info}`);
+  for (const finding of payload.findings) {
+    write(`[${finding.severity.toUpperCase()}] ${finding.id} ${sanitizeConsoleText(finding.location)}: ${sanitizeConsoleText(finding.title)}`);
+    write(`  Evidence: ${sanitizeConsoleText(finding.evidence)}`);
+    write(`  Remediation: ${sanitizeConsoleText(finding.remediation)}`);
+  }
+}
+
 function renderFailure(
   error: unknown,
   json: boolean,
@@ -477,6 +595,10 @@ function redactSource(source: string): string {
 function sanitizeErrorMessage(message: string): string {
   return message.replace(/https?:\/\/[^\s)\]}]+/gi, (candidate) => redactSource(candidate));
 }
+
+function sanitizeConsoleText(value: string): string {
+  return value.replace(/[\u0000-\u001f\u007f]/g, (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
 function helpText(): string {
   return `Agent Plugin CI ${CLI_VERSION}
 
@@ -485,6 +607,7 @@ Usage:
   agentplugin build --openapi <spec-or-url> [options]
   agentplugin build --ir <plugin-ir.json> [options]
   agentplugin validate [package-dir|plugin.json] [--json]
+  agentplugin scan [package-dir|plugin.json] [--fail-on <severity>] [--json]
   agentplugin --version
 
 Build options:
@@ -504,6 +627,11 @@ OpenAPI options:
   --allow-insecure-http           Permit insecure HTTP specification/ref targets
   --allow-cross-origin-refs       Permit cross-origin remote $ref targets
   --allow-external-file-refs      Permit file $refs outside the source root
+
+Security scan options:
+  --fail-on <severity>            Fail on info|low|medium|high|critical (default: high)
+  --fail-on none                  Report findings without a non-zero policy exit
+  --json                          Emit findings, evidence, remediation, and summary as JSON
 
 Exit codes:
   0  Success
