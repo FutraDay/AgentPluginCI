@@ -8,6 +8,9 @@ export interface CompiledPlugin {
 }
 
 export function compilePlugin(ir: PluginIR): CompiledPlugin {
+  assertUniqueNames(ir.skills.map((skill) => skill.name), "skill");
+  assertUniqueNames(ir.mcpServers.map((server) => server.name), "MCP server");
+
   const manifest: Record<string, unknown> = {
     $schema: PLUGIN_SCHEMA,
     name: ir.identity.name
@@ -36,4 +39,12 @@ export function compilePlugin(ir: PluginIR): CompiledPlugin {
 
   const mcp = ir.mcpServers.length ? { $schema: MCP_SCHEMA, mcpServers } : undefined;
   return { manifest, mcp, skills };
+}
+
+function assertUniqueNames(names: string[], label: string): void {
+  const seen = new Set<string>();
+  for (const name of names) {
+    if (seen.has(name)) throw new Error(`Duplicate ${label} name: ${name}`);
+    seen.add(name);
+  }
 }

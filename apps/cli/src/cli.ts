@@ -266,8 +266,12 @@ async function writeCompiledPackage(compiled: CompiledPlugin, outDir: string, cw
   assertSafeOutputTarget(outDir, cwd);
   const skillEntries = Object.entries(compiled.skills).sort(([a], [b]) => a.localeCompare(b));
   const skillsRoot = resolve(outDir, "skills");
+  const portableSkillNames = new Set<string>();
   for (const [name] of skillEntries) {
     assertSafeSkillName(name);
+    const portableName = name.toLowerCase();
+    if (portableSkillNames.has(portableName)) throw new CliError(`Skill names collide on case-insensitive filesystems: ${name}`, "OUTPUT_UNSAFE");
+    portableSkillNames.add(portableName);
     assertPathWithin(skillsRoot, resolve(skillsRoot, name), `Skill path escapes package output: ${name}`);
   }
   const existingLink = await lstat(outDir).catch(() => undefined);
@@ -282,10 +286,7 @@ async function writeCompiledPackage(compiled: CompiledPlugin, outDir: string, cw
     const entries = await readdir(outDir);
     if (entries.length && !force) throw new CliError(`Output directory is not empty: ${outDir}. Re-run with --force to replace it.`, "OUTPUT_EXISTS");
     if (entries.length && force) {
-      const pluginPath = join(outDir, "plugin.json");
-      const pluginFile = await stat(pluginPath).catch(() => undefined);
-      const manifest = pluginFile?.isFile() ? await readJsonRecord(pluginPath, "Existing plugin.json").catch(() => undefined) : undefined;
-      if (!manifest || !validateCompiledPlugin(manifest).ok) throw new CliError(`Refusing to replace a non-generated directory: ${outDir}`, "OUTPUT_UNSAFE");
+      await assertReplaceableGeneratedDirectory(outDir);
       await rm(outDir, { recursive: true, force: true });
     }
   }
@@ -296,6 +297,56 @@ async function writeCompiledPackage(compiled: CompiledPlugin, outDir: string, cw
     const skillDir = resolve(skillsRoot, name);
     await mkdir(skillDir, { recursive: true });
     await writeFile(join(skillDir, "SKILL.md"), content, "utf8");
+  }
+}
+
+async function assertReplaceableGeneratedDirectory(outDir: string): Promise<void> {
+  const entries = await readdir(outDir, { withFileTypes: true });
+  const allowed = new Set(["plugin.json", "mcp.json", "skills"]);
+  for (const entry of entries) {
+    if (!allowed.has(entry.name) || entry.isSymbolicLink()) {
+      throw new CliError(`Refusing to replace directory with non-generated content: ${join(outDir, entry.name)}`, "OUTPUT_UNSAFE");
+    }
+  }
+
+  const pluginEntry = entries.find((entry) => entry.name === "plugin.json");
+  if (!pluginEntry?.isFile()) throw new CliError(`Refusing to replace a non-generated directory: ${outDir}`, "OUTPUT_UNSAFE");
+  const manifest = await readJsonRecord(join(outDir, "plugin.json"), "Existing plugin.json").catch(() => undefined);
+  if (!manifest) throw new CliError(`Refusing to replace a non-generated directory: ${outDir}`, "OUTPUT_UNSAFE");
+
+  const mcpEntry = entries.find((entry) => entry.name === "mcp.json");
+  if (mcpEntry && !mcpEntry.isFile()) throw new CliError(`Refusing to replace malformed generated content: ${join(outDir, "mcp.json")}`, "OUTPUT_UNSAFE");
+  const mcp = mcpEntry ? await readJsonRecord(join(outDir, "mcp.json"), "Existing mcp.json").catch(() => undefined) : undefined;
+  if (mcpEntry && !mcp) throw new CliError(`Refusing to replace malformed generated content: ${join(outDir, "mcp.json")}`, "OUTPUT_UNSAFE");
+  if (!validateCompiledPlugin(manifest, mcp).ok) throw new CliError(`Refusing to replace a non-generated directory: ${outDir}`, "OUTPUT_UNSAFE");
+
+  const skillsEntry = entries.find((entry) => entry.name === "skills");
+  if (!skillsEntry) return;
+  if (!skillsEntry.isDirectory()) throw new CliError(`Refusing to replace malformed generated content: ${join(outDir, "skills")}`, "OUTPUT_UNSAFE");
+  await assertGeneratedSkillsDirectory(join(outDir, "skills"));
+}
+
+async function assertGeneratedSkillsDirectory(skillsRoot: string): Promise<void> {
+  const entries = await readdir(skillsRoot, { withFileTypes: true });
+  if (entries.length === 0) throw new CliError(`Refusing to replace empty non-generated skills directory: ${skillsRoot}`, "OUTPUT_UNSAFE");
+  const portableNames = new Set<string>();
+  for (const entry of entries) {
+    if (entry.isSymbolicLink() || !entry.isDirectory()) {
+      throw new CliError(`Refusing to replace directory with non-generated skill content: ${join(skillsRoot, entry.name)}`, "OUTPUT_UNSAFE");
+    }
+    assertSafeSkillName(entry.name);
+    const portableName = entry.name.toLowerCase();
+    if (portableNames.has(portableName)) throw new CliError(`Existing skill names collide on case-insensitive filesystems: ${entry.name}`, "OUTPUT_UNSAFE");
+    portableNames.add(portableName);
+
+    const skillDir = join(skillsRoot, entry.name);
+    const files = await readdir(skillDir, { withFileTypes: true });
+    if (files.length !== 1 || files[0]?.name !== "SKILL.md" || !files[0].isFile() || files[0].isSymbolicLink()) {
+      throw new CliError(`Refusing to replace directory with non-generated skill content: ${skillDir}`, "OUTPUT_UNSAFE");
+    }
+    const content = await readFile(join(skillDir, "SKILL.md"), "utf8");
+    const expectedPrefix = `---\nname: ${JSON.stringify(entry.name)}\n`;
+    if (!content.startsWith(expectedPrefix)) throw new CliError(`Refusing to replace malformed generated skill: ${skillDir}`, "OUTPUT_UNSAFE");
   }
 }
 

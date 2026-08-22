@@ -41,7 +41,14 @@ pnpm build
 node apps/cli/dist/index.cjs --help
 ```
 
-After the npm package is published, the executable name is `agentplugin` and the package is configured as `@agent-plugin-ci/cli`.
+The v0.1.0 Developer Preview is published publicly as `@agent-plugin-ci/cli`. Install it globally with:
+
+```powershell
+npm install -g @agent-plugin-ci/cli@0.1.0
+agentplugin --version
+```
+
+The installed executable name is `agentplugin`.
 
 ## Build from MCP
 
@@ -102,7 +109,7 @@ A successful build writes only the portable plugin package:
       SKILL.md
 ```
 
-The CLI refuses to replace a non-empty output directory unless `--force` is supplied. Even with `--force`, it will not replace the invocation directory, an ancestor of it, a symbolic-link output, or a non-empty directory that does not contain a valid Agent Plugins `plugin.json`. Skill output names are also constrained to portable single-directory names.
+The CLI refuses to replace a non-empty output directory unless `--force` is supplied. Even with `--force`, replacement is limited to directories that match Agent Plugin CI's generated package shape: a valid `plugin.json`, optional valid `mcp.json`, and generated `skills/<name>/SKILL.md` entries only. Extra files, unexpected directories, symbolic links, malformed generated files, unsafe skill names, and case-insensitive skill-name collisions cause replacement to be refused. The invocation directory, its ancestors, and symbolic-link output roots are also protected.
 
 ## Security baseline
 

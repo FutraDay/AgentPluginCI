@@ -81,6 +81,55 @@ describe("Agent Plugin CI CLI", () => {
     expect(await readFile(join(out, "keep.txt"), "utf8")).toBe("do not delete");
   });
 
+  it("refuses to force-replace generated output after unrelated content is added", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-force-extra-"));
+    const out = join(cwd, "out");
+    const source = join(repoRoot, "fixtures/openapi/search.json");
+    expect(await runCli(["build", "--openapi", source, "--out", out], { cwd, ...capture().io })).toBe(0);
+    await writeFile(join(out, "keep.txt"), "important", "utf8");
+
+    const cap = capture();
+    const code = await runCli(["build", "--openapi", source, "--out", out, "--force", "--json"], { cwd, ...cap.io });
+    expect(code).toBe(1);
+    expect(JSON.parse(cap.stdout[0]!).error.code).toBe("OUTPUT_UNSAFE");
+    expect(await readFile(join(out, "keep.txt"), "utf8")).toBe("important");
+  });
+
+  it("refuses to force-replace generated output when a skill directory contains extra files", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-force-skill-extra-"));
+    const out = join(cwd, "out");
+    const source = join(repoRoot, "fixtures/openapi/search.json");
+    expect(await runCli(["build", "--openapi", source, "--out", out], { cwd, ...capture().io })).toBe(0);
+    const extra = join(out, "skills", "queryitems", "notes.txt");
+    await writeFile(extra, "important", "utf8");
+
+    const cap = capture();
+    const code = await runCli(["build", "--openapi", source, "--out", out, "--force", "--json"], { cwd, ...cap.io });
+    expect(code).toBe(1);
+    expect(JSON.parse(cap.stdout[0]!).error.code).toBe("OUTPUT_UNSAFE");
+    expect(await readFile(extra, "utf8")).toBe("important");
+  });
+
+  it("blocks case-insensitive PluginIR skill directory collisions", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-skill-case-"));
+    const input = join(cwd, "collision.json");
+    const ir = {
+      identity: { name: "safe-plugin" },
+      skills: [
+        { name: "Alpha", description: "first", instructions: "first" },
+        { name: "alpha", description: "second", instructions: "second" }
+      ],
+      mcpServers: []
+    };
+    await writeFile(input, JSON.stringify(ir), "utf8");
+    const cap = capture();
+    const out = join(cwd, "out");
+    const code = await runCli(["build", "--ir", input, "--out", out, "--json"], { cwd, ...cap.io });
+    expect(code).toBe(1);
+    expect(JSON.parse(cap.stdout[0]!).error.code).toBe("OUTPUT_UNSAFE");
+    expect(await stat(out).catch(() => undefined)).toBeUndefined();
+  });
+
   it("blocks PluginIR skill path traversal", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "agentplugin-skill-path-"));
     const input = join(cwd, "malicious.json");

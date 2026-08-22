@@ -20,4 +20,24 @@ describe("compilePlugin", () => {
     expect(result.skills.safe).toContain('description: "line one\\n---\\ninjected: true"');
     expect(result.skills.safe).not.toContain("\n---\ninjected: true");
   });
+
+  it("rejects duplicate skill names instead of silently overwriting compiled skills", () => {
+    expect(() => compilePlugin({
+      ...fixture,
+      skills: [
+        { name: "hello", description: "First", instructions: "First." },
+        { name: "hello", description: "Second", instructions: "Second." }
+      ]
+    })).toThrow(/duplicate skill name: hello/i);
+  });
+
+  it("rejects duplicate MCP server names instead of silently overwriting compiled servers", () => {
+    expect(() => compilePlugin({
+      ...fixture,
+      mcpServers: [
+        { name: "api", transport: "streamable-http", url: "https://one.example/mcp" },
+        { name: "api", transport: "streamable-http", url: "https://two.example/mcp" }
+      ]
+    })).toThrow(/duplicate MCP server name: api/i);
+  });
 });
