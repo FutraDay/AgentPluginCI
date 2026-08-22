@@ -5,7 +5,8 @@
   "type": "module",
   "exports": "./src/index.ts",
   "dependencies": {
-    "@agent-plugin-ci/spec-agent-plugins-v1": "workspace:*"
+    "@agent-plugin-ci/spec-agent-plugins-v1": "workspace:*",
+    "ajv": "^8.20.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json --noEmit",
