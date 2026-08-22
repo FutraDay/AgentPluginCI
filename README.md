@@ -1,66 +1,144 @@
 # Agent Plugin CI
 
-Compiler, validator and compatibility infrastructure for portable Agent Plugins.
+Agent Plugin CI builds and validates portable Agent Plugins from real integration sources.
 
-## Current phase
+> **v0.1 Developer Preview** — MCP ingestion, OpenAPI ingestion, deterministic `PluginIR` normalization, Agent Plugins 1.0 compilation, validation, and a distribution-ready CLI.
 
-Phase 2B adds OpenAPI ingestion while preserving the Phase 2A MCP pipeline and Phase 1 compiler core:
+The core architecture is intentionally fixed:
 
-- stable internal `PluginIR`
-- generic MCP and HTTP-operation capability representation
-- isolated `@agent-plugin-ci/ingest-openapi` package
-- OpenAPI 3.0, 3.1 and 3.2 JSON/YAML loading
-- local and remote OpenAPI source loading
-- bounded internal and external `$ref` resolution
-- parameter and request-body normalization into `PluginIR`
-- OpenAPI 3.2 `QUERY`, `querystring` and `additionalOperations` support
-- deterministic operation-to-skill generation
-- document, schema, reference and operation limits
-- secure defaults for private networks, insecure HTTP, cross-origin refs and file refs outside the source root
-- OpenAPI source support in the CLI
-- existing MCP ingestion and compiler behavior preserved
+`Source -> PluginIR -> Compiler -> Validator -> Package`
 
-The source pipelines remain:
+No source ingestion path compiles directly into `plugin.json`.
 
-`MCP source -> PluginIR -> Compiler -> plugin.json / mcp.json / SKILL.md -> Validator`
+## Supported in v0.1
 
-`OpenAPI source -> PluginIR -> Compiler -> plugin.json / SKILL.md -> Validator`
+- MCP configuration files and MCP URLs
+- optional MCP SDK v2 capability/tool discovery
+- OpenAPI 3.0, 3.1, and 3.2 JSON/YAML files
+- remote OpenAPI specifications with secure defaults
+- deterministic skill generation from discovered capabilities
+- `plugin.json`, optional `mcp.json`, and `skills/*/SKILL.md` output
+- package validation from the CLI
+- machine-readable JSON results for CI
+- bundled npm CLI package
+- GitHub CI and tagged release packaging
 
-## Verify
+Markdown/docs/repository ingestion, compatibility matrices, certification, hosted builds, and the web application are intentionally deferred until after v0.1.
+
+## Quick start
+
+Requirements:
+
+- Node.js 20+
+- pnpm 11.2.2 for repository development
+
+From the repository:
 
 ```powershell
 cd C:\Users\dupla\Desktop\AgentPluginCI
 pnpm install
+pnpm build
+node apps/cli/dist/index.cjs --help
+```
+
+After the npm package is published, the executable name is `agentplugin` and the package is configured as `@agent-plugin-ci/cli`.
+
+## Build from MCP
+
+Build an MCP configuration without executing its stdio server:
+
+```powershell
+node apps/cli/dist/index.cjs build --mcp fixtures/mcp/stdio.json --no-discover --name mcp-example --out dist/mcp-example
+```
+
+To discover stdio tools, execution must be explicitly enabled:
+
+```powershell
+node apps/cli/dist/index.cjs build --mcp fixtures/mcp/stdio.json --allow-stdio-discovery --name mcp-example --out dist/mcp-example --force
+```
+
+Remote MCP URL builds are supported. Capability discovery is enabled by default, while private-network and insecure HTTP targets remain blocked unless explicitly allowed.
+
+```powershell
+node apps/cli/dist/index.cjs build --mcp https://example.com/mcp --no-discover --name example-plugin
+```
+
+## Build from OpenAPI
+
+```powershell
+node apps/cli/dist/index.cjs build --openapi fixtures/openapi/support.yaml --name support-api --out dist/support-api
+node apps/cli/dist/index.cjs build --openapi fixtures/openapi/search.json --name search-api --out dist/search-api
+```
+
+Remote OpenAPI sources use HTTPS and public-network targets by default. Private-network access, insecure HTTP, cross-origin `$ref` loading, and external file refs outside the source root require explicit opt-in flags.
+
+## Validate a package
+
+```powershell
+node apps/cli/dist/index.cjs validate dist/support-api
+```
+
+Validation accepts either a package directory or its `plugin.json` path. Exit code `0` means valid; exit code `1` means the package, input, build, or security check failed; exit code `2` means the CLI invocation itself is invalid.
+
+## Machine-readable CI output
+
+Add `--json` to `build` or `validate` to emit one JSON object on stdout.
+
+```powershell
+node apps/cli/dist/index.cjs build --openapi fixtures/openapi/search.json --name search-api --out dist/search-api --json
+node apps/cli/dist/index.cjs validate dist/search-api --json
+```
+
+## Output structure
+
+A successful build writes only the portable plugin package:
+
+```text
+<output>/
+  plugin.json
+  mcp.json                 # MCP builds only
+  skills/
+    <skill-name>/
+      SKILL.md
+```
+
+The CLI refuses to replace a non-empty output directory unless `--force` is supplied. Even with `--force`, it will not replace the invocation directory, an ancestor of it, a symbolic-link output, or a non-empty directory that does not contain a valid Agent Plugins `plugin.json`. Skill output names are also constrained to portable single-directory names.
+
+## Security baseline
+
+Imported sources are untrusted. v0.1 keeps these behaviors deny-by-default:
+
+- stdio MCP process execution
+- private-network MCP/OpenAPI access
+- insecure HTTP targets
+- cross-origin remote OpenAPI `$ref` targets
+- OpenAPI file refs outside the source root
+- oversized MCP/OpenAPI/schema inputs
+- unsafe schema keys and excessive nesting where implemented by ingestion packages
+
+Inline MCP environment values are normalized to environment-variable placeholders rather than copied into generated `mcp.json`.
+
+Use the `--allow-*` flags only for sources you trust and only when the target workflow requires them.
+## Development verification
+
+Before a launch-hardening checkpoint can pass:
+
+```powershell
+cd C:\Users\dupla\Desktop\AgentPluginCI
 pnpm typecheck
 pnpm test
 pnpm build
+pnpm pack:cli
+git diff --check
+git status
 ```
 
-## Build
+`pnpm verify` runs typechecking, the full test suite, and all workspace builds.
 
-Build the original PluginIR fixture:
+## Release packaging
 
-```powershell
-pnpm cli
-```
+The CLI package is configured at version `0.1.0` with the executable name `agentplugin`. `pnpm pack:cli` creates the npm tarball under `artifacts/`.
 
-Build from an MCP configuration and explicitly allow stdio discovery:
+GitHub Actions performs the same verification on pushes and pull requests, including MCP, OpenAPI and raw PluginIR CLI smoke builds plus an install-and-run test of the packed npm tarball. Tags matching `v*` run the full verification pipeline, require the tag to match the CLI package version, install and smoke-test the release tarball, and create a GitHub release containing that artifact.
 
-```powershell
-pnpm cli -- --mcp fixtures/mcp/stdio.json --allow-stdio-discovery --name mcp-example
-```
-
-Build from a remote MCP URL without capability discovery:
-
-```powershell
-pnpm cli -- --mcp https://example.com/mcp --no-discover --name example-plugin
-```
-
-Build from a local OpenAPI JSON or YAML document:
-
-```powershell
-pnpm cli -- --openapi fixtures/openapi/support.yaml --name support-api
-pnpm cli -- --openapi fixtures/openapi/search.json --name search-api
-```
-
-Remote OpenAPI URLs use HTTPS and public-network targets by default. Private-network access, insecure HTTP, cross-origin `$ref` loading and external file refs outside the source root require explicit opt-in flags.
+Actual npm publication is intentionally not automated until the npm organization/package ownership and publishing credentials are configured. That keeps the repository release-ready without introducing a secret or account dependency into v0.1 hardening.

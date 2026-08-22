@@ -1,19 +1,26 @@
 {
   "name": "@agent-plugin-ci/cli",
   "version": "0.1.0",
-  "private": true,
+  "description": "Build and validate portable Agent Plugins from MCP, OpenAPI, or PluginIR sources.",
+  "private": false,
   "type": "module",
-  "dependencies": {
+  "bin": { "agentplugin": "dist/index.cjs" },
+  "files": ["dist"],
+  "engines": { "node": ">=20" },
+  "publishConfig": { "access": "public" },
+  "devDependencies": {
     "@agent-plugin-ci/compiler": "workspace:*",
     "@agent-plugin-ci/ingest-mcp": "workspace:*",
     "@agent-plugin-ci/ingest-openapi": "workspace:*",
     "@agent-plugin-ci/plugin-ir": "workspace:*",
-    "@agent-plugin-ci/validator": "workspace:*"
+    "@agent-plugin-ci/validator": "workspace:*",
+    "esbuild": "^0.28.2"
   },
   "scripts": {
     "start": "tsx src/index.ts",
-    "build": "tsc -p tsconfig.json --noEmit",
+    "build": "node scripts/build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run --passWithNoTests"
+    "test": "vitest run --passWithNoTests",
+    "prepack": "pnpm run build && node dist/index.cjs --version"
   }
 }
