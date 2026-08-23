@@ -106,7 +106,6 @@ jobs:
     env:
       RELEASE_VERSION: ${{ needs.package.outputs.version }}
       RELEASE_TARBALL: ${{ needs.package.outputs.tarball }}
-      NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/agentplugin-release.npmrc
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -159,6 +158,8 @@ jobs:
           if (npmResponse.status === 200) throw new Error("npm package version already exists");
           if (npmResponse.status !== 404) throw new Error(`npm release preflight failed with status ${npmResponse.status}`);'
       - name: Pin trusted-publishing npm CLI
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/agentplugin-release.npmrc
         shell: bash
         run: |
           set -euo pipefail
@@ -171,6 +172,7 @@ jobs:
       - name: Publish verified tarball with npm trusted publishing
         env:
           NPM_CONFIG_IGNORE_SCRIPTS: "true"
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/agentplugin-release.npmrc
         shell: bash
         run: |
           set -euo pipefail
