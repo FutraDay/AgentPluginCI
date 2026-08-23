@@ -1,6 +1,8 @@
 import { createInterface } from "node:readline";
 
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
+const TOOL_NAME = "phase3f_fixture_echo";
+const TOOL_RESULT = "agent-plugin-ci:phase3g-tool-invocation-ok:v1";
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -37,10 +39,32 @@ for await (const line of input) {
       id: request.id,
       result: {
         tools: [{
-          name: "phase3f_fixture_echo",
-          description: "Return deterministic Phase 3F fixture evidence.",
-          inputSchema: { type: "object", properties: {}, additionalProperties: false }
+          name: TOOL_NAME,
+          description: "Return deterministic Phase 3G tool invocation evidence.",
+          inputSchema: { type: "object", properties: {}, additionalProperties: false },
+          annotations: { readOnlyHint: true, openWorldHint: false }
         }]
+      }
+    });
+    continue;
+  }
+  if (request.method === "tools/call") {
+    const argumentsValue = request.params?.arguments;
+    if (request.params?.name !== TOOL_NAME
+      || !argumentsValue || typeof argumentsValue !== "object" || Array.isArray(argumentsValue)
+      || Object.keys(argumentsValue).length !== 0) {
+      send({
+        jsonrpc: "2.0",
+        id: request.id,
+        error: { code: -32602, message: "Invalid deterministic fixture invocation" }
+      });
+      continue;
+    }
+    send({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: {
+        content: [{ type: "text", text: TOOL_RESULT }]
       }
     });
     continue;

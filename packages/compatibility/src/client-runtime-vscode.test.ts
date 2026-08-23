@@ -1,10 +1,11 @@
+import { spawn as nodeSpawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { lstatSync, mkdirSync, readlinkSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { runClientRuntimeHarness, type ClientRuntimeAdapterContext } from "./client-runtime.js";
 import {
@@ -18,6 +19,10 @@ const OBSERVER_DIRECTORY = "agent-plugin-ci.agent-plugin-ci-runtime-observer-1.0
 const OBSERVER_MARKER_FILENAME = "consumer-surface-exercised.marker";
 const OBSERVER_MARKER_CONTENT = "agent-plugin-ci:consumer-surface-exercised:v1\n";
 const OBSERVER_MCP_EVIDENCE_FILENAME = "client-mediated-mcp-evidence.json";
+const EXPECTED_MCP_SERVER_NAME = "agent-plugin-ci-phase3f-fixture";
+const EXPECTED_MCP_TOOL_NAME = "phase3f_fixture_echo";
+const EXPECTED_MCP_TOOL_RESULT = "agent-plugin-ci:phase3g-tool-invocation-ok:v1";
+const EXPECTED_VSCODE_MCP_TOOL_ID = "mcp_agent-plugin-_phase3f_fixture_echo";
 
 afterEach(async () => {
   for (const root of packageRoots.splice(0)) await rm(root, { recursive: true, force: true });
@@ -27,12 +32,34 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
   it("declares the real target and all conservative opt-in capabilities", () => {
     const adapter = createVscodeClientRuntimeAdapter({ executablePath: process.execPath });
     expect(adapter.metadata).toEqual({
-      adapter: { id: "vscode-github-copilot", version: "1.3.0" },
+      adapter: { id: "vscode-github-copilot", version: "1.4.0" },
       targetClient: { id: "vscode-github-copilot", name: "VS Code/GitHub Copilot" },
       synthetic: false,
       requiredCapabilities: ["package-read", "client-process", "client-filesystem", "network"]
     });
     expect(VSCODE_CLIENT_RUNTIME_REQUIRED_CAPABILITIES).toEqual(adapter.metadata.requiredCapabilities);
+  });
+
+  it("serves the deterministic repository MCP fixture through a bounded direct process", async () => {
+    const responses = await runDeterministicFixtureExchange();
+    expect(responses).toHaveLength(3);
+    expect(responses[0]).toMatchObject({
+      jsonrpc: "2.0",
+      id: 1,
+      result: {
+        serverInfo: { name: EXPECTED_MCP_SERVER_NAME, version: "1.0.0" }
+      }
+    });
+    expect(responses[1]).toMatchObject({
+      jsonrpc: "2.0",
+      id: 2,
+      result: { tools: [{ name: EXPECTED_MCP_TOOL_NAME, annotations: { readOnlyHint: true, openWorldHint: false } }] }
+    });
+    expect(responses[2]).toEqual({
+      jsonrpc: "2.0",
+      id: 3,
+      result: { content: [{ type: "text", text: EXPECTED_MCP_TOOL_RESULT }] }
+    });
   });
 
   it("keeps client-mediated MCP denied independently of the generic client lifecycle", async () => {
@@ -48,13 +75,17 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
 
     expect(report.execution).toEqual({ status: "denied", complete: false, finalize: "not-run" });
     expect(report.mcpStartup).toBe("not-assessed");
+    expect(report.toolInvocation).toBe("not-assessed");
     expect(fake.invocations).toEqual([]);
   });
 
-  it("reports exactly attributable client-mediated startup, handshake, and tool exposure", async () => {
+  it("reports exactly attributable client-mediated startup, handshake, tool exposure, and tool invocation", async () => {
     const serverName = "phase3f-fixture";
     const packageRoot = await createPackage({ mcpServerName: serverName });
-    const fake = fakeRuntime(packageRoot, { mcpEvidence: validMcpEvidence(packageRoot, serverName) });
+    const fake = fakeRuntime(packageRoot, {
+      versionOutput: "1.131.0\nfixture-commit\nx64\n",
+      mcpEvidence: validMcpEvidence(packageRoot, serverName)
+    });
     const report = await runClientRuntimeHarness(packageRoot, createVscodeClientRuntimeAdapter({
       executablePath: process.execPath,
       observationWindowMs: 100,
@@ -73,9 +104,11 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
       mcpStartup: "observed",
       mcpHandshake: "observed",
       toolExposure: "observed",
+      toolInvocation: "observed",
       interoperability: "not-established"
     });
     expect(report.evidence.map((item) => item.code)).toContain("APCI-CLIENT-VSCODE-MCP-OBSERVED-001");
+    expect(report.evidence.map((item) => item.code)).toContain("APCI-CLIENT-VSCODE-TOOL-INVOKED-001");
     const settings = JSON.parse(await fake.settingsReads[0]!) as Record<string, unknown>;
     expect(settings["chat.mcp.access"]).toBe("all");
     expect(settings["chat.mcp.autostart"]).toBe("never");
@@ -85,6 +118,10 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
     expect(observerSource).toContain('executeCommand("workbench.mcp.startServer", serverId');
     expect(observerSource).toContain("LanguageModelToolMCPSource");
     expect(observerSource).toContain("waitForLiveTools: true");
+    expect(observerSource).toContain("vscode.lm.invokeTool(eligibleTools[0].name, {");
+    expect(observerSource).toContain("toolInvocationToken: undefined");
+    expect(observerSource).toContain(EXPECTED_VSCODE_MCP_TOOL_ID);
+    expect(observerSource).not.toContain("selectChatModels");
     expect(JSON.stringify(report)).not.toContain(packageRoot);
   });
 
@@ -93,14 +130,20 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
     const packageRoot = await createPackage({ mcpServerName: serverName });
     for (const mcpEvidence of [
       "{not-json",
-      validMcpEvidence(packageRoot, serverName, [
-        { name: "duplicate", sourceLabel: serverName, sourceName: "fixture" },
-        { name: "duplicate", sourceLabel: serverName, sourceName: "fixture" }
-      ]),
-      validMcpEvidence(packageRoot, serverName, [
-        { name: "first", sourceLabel: serverName, sourceName: "source-a" },
-        { name: "second", sourceLabel: serverName, sourceName: "source-b" }
-      ])
+      validMcpEvidence(packageRoot, serverName, {
+        tools: [
+          { name: "duplicate-secret-value", sourceLabel: serverName, sourceName: EXPECTED_MCP_SERVER_NAME },
+          { name: "duplicate-secret-value", sourceLabel: serverName, sourceName: EXPECTED_MCP_SERVER_NAME }
+        ],
+        invocation: { attempted: false, completed: false, resultMatched: false }
+      }),
+      validMcpEvidence(packageRoot, serverName, {
+        tools: [{
+          name: EXPECTED_VSCODE_MCP_TOOL_ID,
+          sourceLabel: serverName,
+          sourceName: "raw-source-secret-value"
+        }]
+      })
     ]) {
       const fake = fakeRuntime(packageRoot, { mcpEvidence });
       const report = await runClientRuntimeHarness(packageRoot, createVscodeClientRuntimeAdapter({
@@ -116,7 +159,105 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
       expect(report.execution).toEqual({ status: "fail", complete: false, finalize: "complete" });
       expect(report.mcpHandshake).toBe("unknown");
       expect(report.toolExposure).toBe("unknown");
-      expect(JSON.stringify(report)).not.toContain("duplicate");
+      expect(report.toolInvocation).toBe("unknown");
+      expect(JSON.stringify(report)).not.toContain("secret-value");
+    }
+  });
+
+  it("keeps exposure observed while classifying bounded non-successful invocations", async () => {
+    const serverName = "phase3f-fixture";
+    const packageRoot = await createPackage({ mcpServerName: serverName });
+    const cases = [
+      {
+        evidence: validMcpEvidence(packageRoot, serverName, {
+          tools: [
+            { name: EXPECTED_VSCODE_MCP_TOOL_ID, sourceLabel: serverName, sourceName: EXPECTED_MCP_SERVER_NAME },
+            { name: "second_matching_tool", sourceLabel: serverName, sourceName: EXPECTED_MCP_SERVER_NAME }
+          ],
+          invocation: { attempted: false, completed: false, resultMatched: false }
+        }),
+        summary: "No uniquely eligible newly exposed tool was invoked."
+      },
+      {
+        evidence: validMcpEvidence(packageRoot, serverName, {
+          tools: [{ name: "wrong_client_tool_id", sourceLabel: serverName, sourceName: EXPECTED_MCP_SERVER_NAME }],
+          invocation: { attempted: false, completed: false, resultMatched: false }
+        }),
+        summary: "No uniquely eligible newly exposed tool was invoked."
+      },
+      {
+        evidence: validMcpEvidence(packageRoot, serverName, {
+          invocation: { attempted: true, completed: false, resultMatched: false }
+        }),
+        summary: "VS Code did not complete the bounded tool invocation; arbitrary client/tool error details were discarded."
+      },
+      {
+        evidence: validMcpEvidence(packageRoot, serverName, {
+          invocation: { attempted: true, completed: true, resultMatched: false }
+        }),
+        summary: "VS Code completed the bounded tool invocation, but the exact deterministic result did not match."
+      }
+    ];
+
+    for (const fixtureCase of cases) {
+      const fake = fakeRuntime(packageRoot, { mcpEvidence: fixtureCase.evidence });
+      const report = await runClientRuntimeHarness(packageRoot, createVscodeClientRuntimeAdapter({
+        executablePath: process.execPath,
+        observationWindowMs: 100,
+        allowMcpRuntime: true,
+        dependencies: fake.dependencies
+      }), {
+        allowExecution: true,
+        grantedCapabilities: [...VSCODE_CLIENT_RUNTIME_REQUIRED_CAPABILITIES],
+        timeoutMs: 2_000
+      });
+      expect(report.execution).toEqual({ status: "unknown", complete: true, finalize: "complete" });
+      expect(report.toolExposure).toBe("observed");
+      expect(report.toolInvocation).toBe("not-observed");
+      expect(report.interoperability).toBe("not-established");
+      expect(report.evidence).toContainEqual(expect.objectContaining({
+        code: "APCI-CLIENT-VSCODE-TOOL-INVOKED-002",
+        summary: fixtureCase.summary
+      }));
+    }
+  });
+
+  it("fails closed on malformed or ambiguous invocation evidence without retaining raw values", async () => {
+    const serverName = "phase3f-fixture";
+    const packageRoot = await createPackage({ mcpServerName: serverName });
+    const secret = "raw-invocation-secret-value";
+    for (const mcpEvidence of [
+      validMcpEvidence(packageRoot, serverName, {
+        invocation: { attempted: true, completed: false, resultMatched: true }
+      }),
+      validMcpEvidence(packageRoot, serverName, {
+        invocation: { attempted: true, completed: true, resultMatched: true, rawResult: secret }
+      }),
+      validMcpEvidence(packageRoot, serverName, {
+        tools: [
+          { name: EXPECTED_VSCODE_MCP_TOOL_ID, sourceLabel: serverName, sourceName: EXPECTED_MCP_SERVER_NAME },
+          { name: "ambiguous_second_tool", sourceLabel: serverName, sourceName: EXPECTED_MCP_SERVER_NAME }
+        ],
+        invocation: { attempted: true, completed: true, resultMatched: true }
+      })
+    ]) {
+      const fake = fakeRuntime(packageRoot, { mcpEvidence });
+      const report = await runClientRuntimeHarness(packageRoot, createVscodeClientRuntimeAdapter({
+        executablePath: process.execPath,
+        observationWindowMs: 100,
+        allowMcpRuntime: true,
+        dependencies: fake.dependencies
+      }), {
+        allowExecution: true,
+        grantedCapabilities: [...VSCODE_CLIENT_RUNTIME_REQUIRED_CAPABILITIES],
+        timeoutMs: 2_000
+      });
+      expect(report.execution).toEqual({ status: "fail", complete: false, finalize: "complete" });
+      expect(report.toolExposure).toBe("unknown");
+      expect(report.toolInvocation).toBe("unknown");
+      expect(JSON.stringify(report)).not.toContain(secret);
+      expect(JSON.stringify(report)).not.toContain("rawResult");
+      expect(JSON.stringify(report)).not.toContain("ambiguous_second_tool");
     }
   });
 
@@ -137,6 +278,8 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
     expect(report.mcpStartup).toBe("unknown");
     expect(report.mcpHandshake).toBe("unknown");
     expect(report.toolExposure).toBe("unknown");
+    expect(report.toolInvocation).toBe("unknown");
+    expect(report.evidence.map((item) => item.code)).toContain("APCI-CLIENT-VSCODE-TOOL-INVOKED-003");
     expect(report.interoperability).toBe("not-established");
   });
 
@@ -185,7 +328,7 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
     });
 
     expect(report).toMatchObject({
-      adapter: { version: "1.3.0" },
+      adapter: { version: "1.4.0" },
       targetClient: { version: "1.118.0" },
       execution: { status: "pass", complete: true, finalize: "complete" },
       packageInstall: "not-observed",
@@ -193,6 +336,7 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
       mcpStartup: "not-assessed",
       mcpHandshake: "not-assessed",
       toolExposure: "not-assessed",
+      toolInvocation: "not-assessed",
       interoperability: "not-established"
     });
     const installedExecutableInvocations = fake.invocations.filter(
@@ -378,6 +522,7 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
     expect(report.targetClient.version).toBe("1.118.1");
     expect(report.clientLoad).toBe("observed");
     expect(report.mcpHandshake).toBe("not-assessed");
+    expect(report.toolInvocation).toBe("not-assessed");
     expect(report.interoperability).toBe("not-established");
     const clientInvocations = fake.invocations.filter((item) => item.executable === installation.executablePath);
     expect(clientInvocations).toHaveLength(2);
@@ -515,6 +660,7 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
       mcpStartup: "not-assessed",
       mcpHandshake: "not-assessed",
       toolExposure: "not-assessed",
+      toolInvocation: "not-assessed",
       interoperability: "not-established"
     });
     expect(JSON.stringify(report)).not.toContain("fixture-secret-value");
@@ -853,9 +999,59 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
     expect(report.targetClient.version).toBeUndefined();
     expect(report.execution).toEqual({ status: "unknown", complete: true, finalize: "complete" });
     expect(report.clientLoad).toBe("unknown");
+    expect(report.toolInvocation).toBe("not-assessed");
     expect(JSON.stringify(report)).toContain("APCI-CLIENT-VSCODE-VERSION-002");
     expect(JSON.stringify(report)).not.toContain("hidden-value");
     expect(fake.invocations.filter((item) => item.executable === process.execPath)).toHaveLength(1);
+  });
+
+  it("fails closed when MCP is enabled but the target version or client load is unavailable", async () => {
+    const serverName = "phase3f-fixture";
+    const packageRoot = await createPackage({ mcpServerName: serverName });
+    const unavailableVersion = fakeRuntime(packageRoot, {
+      versionOutput: "unrecognized-version\nraw-version-secret-value\n"
+    });
+    const versionReport = await runClientRuntimeHarness(packageRoot, createVscodeClientRuntimeAdapter({
+      executablePath: process.execPath,
+      allowMcpRuntime: true,
+      dependencies: unavailableVersion.dependencies
+    }), {
+      allowExecution: true,
+      grantedCapabilities: [...VSCODE_CLIENT_RUNTIME_REQUIRED_CAPABILITIES],
+      timeoutMs: 2_000
+    });
+    expect(versionReport).toMatchObject({
+      execution: { status: "unknown", complete: true, finalize: "complete" },
+      packageInstall: "not-observed",
+      clientLoad: "unknown",
+      mcpStartup: "unknown",
+      mcpHandshake: "unknown",
+      toolExposure: "unknown",
+      toolInvocation: "unknown",
+      interoperability: "not-established"
+    });
+    expect(unavailableVersion.invocations.some((item) => item.args.includes("--wait"))).toBe(false);
+    expect(JSON.stringify(versionReport)).not.toContain("raw-version-secret-value");
+
+    const unavailableClient = fakeRuntime(packageRoot, {
+      observerActivation: false,
+      mcpEvidence: validMcpEvidence(packageRoot, serverName)
+    });
+    const clientReport = await runClientRuntimeHarness(packageRoot, createVscodeClientRuntimeAdapter({
+      executablePath: process.execPath,
+      observationWindowMs: 100,
+      allowMcpRuntime: true,
+      dependencies: unavailableClient.dependencies
+    }), {
+      allowExecution: true,
+      grantedCapabilities: [...VSCODE_CLIENT_RUNTIME_REQUIRED_CAPABILITIES],
+      timeoutMs: 2_000
+    });
+    expect(clientReport.clientLoad).toBe("unknown");
+    expect(clientReport.mcpStartup).toBe("unknown");
+    expect(clientReport.toolExposure).toBe("unknown");
+    expect(clientReport.toolInvocation).toBe("unknown");
+    expect(clientReport.interoperability).toBe("not-established");
   });
 
   it("denies missing capabilities before validation or process execution", async () => {
@@ -1032,6 +1228,89 @@ class FakeChild extends EventEmitter {
     this.finish(null as unknown as number);
     return true;
   }
+}
+
+async function runDeterministicFixtureExchange(): Promise<unknown[]> {
+  const fixturePath = fileURLToPath(new URL(
+    "../../../fixtures/client-runtime/vscode-package/vscode-mcp-server.mjs",
+    import.meta.url
+  ));
+  const maximumOutputBytes = 64 * 1024;
+  const timeoutMs = 2_000;
+  return await new Promise<unknown[]>((resolveExchange, rejectExchange) => {
+    const child = nodeSpawn(process.execPath, [fixturePath], {
+      shell: false,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    const output: Buffer[] = [];
+    let outputBytes = 0;
+    let errorBytes = 0;
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      rejectExchange(new Error("Deterministic MCP fixture exceeded its bounded timeout"));
+    }, timeoutMs);
+    const fail = (message: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.kill("SIGKILL");
+      rejectExchange(new Error(message));
+    };
+    child.stdout.on("data", (chunk: Buffer) => {
+      outputBytes += chunk.length;
+      if (outputBytes > maximumOutputBytes) {
+        fail("Deterministic MCP fixture exceeded its bounded stdout allowance");
+        return;
+      }
+      output.push(chunk);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      errorBytes += chunk.length;
+      if (errorBytes > maximumOutputBytes) {
+        fail("Deterministic MCP fixture exceeded its bounded stderr allowance");
+      }
+    });
+    child.once("error", () => fail("Deterministic MCP fixture failed to launch"));
+    child.once("exit", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        rejectExchange(new Error("Deterministic MCP fixture did not exit successfully"));
+        return;
+      }
+      try {
+        const responses = Buffer.concat(output, outputBytes)
+          .toString("utf8")
+          .split(/\r?\n/)
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as unknown);
+        resolveExchange(responses);
+      } catch {
+        rejectExchange(new Error("Deterministic MCP fixture emitted malformed JSON"));
+      }
+    });
+    child.stdin.end([
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test", version: "1.0.0" } }
+      }),
+      JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: { name: EXPECTED_MCP_TOOL_NAME, arguments: {} }
+      }),
+      ""
+    ].join("\n"), "utf8");
+  });
 }
 
 function fakeRuntime(
@@ -1262,16 +1541,31 @@ function contextFor(packageRoot: string): ClientRuntimeAdapterContext {
 function validMcpEvidence(
   packageRoot: string,
   serverName: string,
-  tools = [{ name: "mcp_phase3f_fixture_echo", sourceLabel: serverName, sourceName: "phase3f-fixture" }]
+  options: {
+    tools?: Array<{ name: string; sourceLabel: string; sourceName: string }>;
+    matchingToolCount?: number;
+    newlyExposedToolCount?: number;
+    invocation?: Record<string, unknown>;
+    extra?: Record<string, unknown>;
+  } = {}
 ) {
+  const tools = options.tools ?? [{
+    name: EXPECTED_VSCODE_MCP_TOOL_ID,
+    sourceLabel: serverName,
+    sourceName: EXPECTED_MCP_SERVER_NAME
+  }];
   return {
-    schemaVersion: "1.0.0",
+    schemaVersion: "1.1.0",
     expectedServerLabel: serverName,
+    expectedServerName: EXPECTED_MCP_SERVER_NAME,
+    expectedToolName: EXPECTED_MCP_TOOL_NAME,
     serverId: `plugin.${pathToFileURL(packageRoot).href}.${serverName}`,
     startCommandCompleted: true,
-    matchingToolCount: tools.length,
-    newlyExposedToolCount: tools.length,
-    tools
+    matchingToolCount: options.matchingToolCount ?? tools.length,
+    newlyExposedToolCount: options.newlyExposedToolCount ?? tools.length,
+    tools,
+    invocation: options.invocation ?? { attempted: true, completed: true, resultMatched: true },
+    ...options.extra
   };
 }
 

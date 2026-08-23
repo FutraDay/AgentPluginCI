@@ -47,6 +47,7 @@ describe("client runtime harness", () => {
       mcpStartup: "not-assessed",
       mcpHandshake: "not-assessed",
       toolExposure: "not-assessed",
+      toolInvocation: "not-assessed",
       interoperability: "not-established"
     });
     expect(JSON.stringify(report)).toContain("APCI-CLIENT-POLICY-001");
@@ -144,7 +145,7 @@ describe("client runtime harness", () => {
     const second = await runClientRuntimeHarness("package", createSyntheticFixtureClientAdapter(), { allowExecution: true });
     expect(events).toEqual(["initialize", "execute", "finalize:pass"]);
     expect(first).toMatchObject({
-      schemaVersion: "1.1.0",
+      schemaVersion: "1.2.0",
       evidenceLevel: "client-runtime-observation",
       scope: "client-adapter-harness",
       synthetic: true,
@@ -156,6 +157,7 @@ describe("client runtime harness", () => {
       mcpStartup: "not-assessed",
       mcpHandshake: "not-assessed",
       toolExposure: "not-assessed",
+      toolInvocation: "not-assessed",
       interoperability: "not-established"
     });
     expect(first.note).toContain("does not establish interoperability with any real client");
@@ -177,6 +179,7 @@ describe("client runtime harness", () => {
       mcpStartup: "unknown",
       mcpHandshake: "unknown",
       toolExposure: "unknown",
+      toolInvocation: "unknown",
       interoperability: "not-established"
     });
     expect(JSON.stringify(report)).toContain("APCI-CLIENT-LIFECYCLE-002");
@@ -236,6 +239,7 @@ describe("client runtime harness", () => {
       mcpStartup: "unknown",
       mcpHandshake: "unknown",
       toolExposure: "unknown",
+      toolInvocation: "unknown",
       interoperability: "not-established"
     });
     expect(JSON.stringify(report)).toContain("APCI-CLIENT-OUTPUT-001");
@@ -254,6 +258,17 @@ describe("client runtime harness", () => {
     const sensitiveVersionReport = await runClientRuntimeHarness("package", sensitiveVersion, { allowExecution: true });
     expect(sensitiveVersionReport.execution.status).toBe("unknown");
     expect(JSON.stringify(sensitiveVersionReport)).not.toContain("fixtureSecret123");
+
+    const legacyOutput = adapter("legacy-output-adapter", {
+      execute: () => {
+        const { toolInvocation: _toolInvocation, ...legacy } = output();
+        return legacy;
+      }
+    });
+    const legacyReport = await runClientRuntimeHarness("package", legacyOutput, { allowExecution: true });
+    expect(legacyReport.execution.status).toBe("unknown");
+    expect(legacyReport.toolInvocation).toBe("unknown");
+    expect(JSON.stringify(legacyReport)).toContain("APCI-CLIENT-OUTPUT-001");
   });
 
   it("does not accept synthetic or incomplete interoperability claims", async () => {
@@ -298,6 +313,7 @@ function output(evidence = [{ code: "APCI-CLIENT-TEST-001", location: "test", su
     mcpStartup: "not-assessed",
     mcpHandshake: "not-assessed",
     toolExposure: "not-assessed",
+    toolInvocation: "not-assessed",
     interoperability: "established",
     evidence
   } as const;

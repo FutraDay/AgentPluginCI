@@ -35,7 +35,7 @@ export const VSCODE_CLIENT_RUNTIME_REQUIRED_CAPABILITIES = Object.freeze([
   "network"
 ] as const);
 
-const ADAPTER_VERSION = "1.3.0";
+const ADAPTER_VERSION = "1.4.0";
 const MIN_OBSERVATION_MS = 100;
 const MAX_OBSERVATION_MS = 20_000;
 const DEFAULT_OBSERVATION_MS = 7_500;
@@ -61,9 +61,13 @@ const OBSERVER_EXTENSION_ID = "agent-plugin-ci.agent-plugin-ci-runtime-observer"
 const OBSERVER_MARKER_FILENAME = "consumer-surface-exercised.marker";
 const OBSERVER_MARKER_CONTENT = "agent-plugin-ci:consumer-surface-exercised:v1\n";
 const OBSERVER_MCP_EVIDENCE_FILENAME = "client-mediated-mcp-evidence.json";
-const OBSERVER_MCP_EVIDENCE_SCHEMA_VERSION = "1.0.0";
+const OBSERVER_MCP_EVIDENCE_SCHEMA_VERSION = "1.1.0";
 const MAX_OBSERVER_MCP_EVIDENCE_BYTES = 16 * 1024;
 const MAX_OBSERVED_MCP_TOOLS = 64;
+const EXPECTED_MCP_SERVER_NAME = "agent-plugin-ci-phase3f-fixture";
+const EXPECTED_MCP_TOOL_NAME = "phase3f_fixture_echo";
+const EXPECTED_MCP_TOOL_RESULT = "agent-plugin-ci:phase3g-tool-invocation-ok:v1";
+const EXPECTED_VSCODE_MCP_TOOL_ID = "mcp_agent-plugin-_phase3f_fixture_echo";
 const OBSERVER_MANIFEST_VERSION = "1.0.0";
 const LOAD_ONLY_OBSERVER_MANIFEST = observerManifest(false);
 const MCP_OBSERVER_MANIFEST = observerManifest(true);
@@ -113,6 +117,10 @@ const EVIDENCE_FILENAME = ${JSON.stringify(OBSERVER_MCP_EVIDENCE_FILENAME)};
 const EVIDENCE_SCHEMA_VERSION = ${JSON.stringify(OBSERVER_MCP_EVIDENCE_SCHEMA_VERSION)};
 const PACKAGE_ROOT = ${JSON.stringify(packageRoot)};
 const EXPECTED_SERVER_LABEL = ${JSON.stringify(expectedServerLabel)};
+const EXPECTED_SERVER_NAME = ${JSON.stringify(EXPECTED_MCP_SERVER_NAME)};
+const EXPECTED_TOOL_NAME = ${JSON.stringify(EXPECTED_MCP_TOOL_NAME)};
+const EXPECTED_TOOL_RESULT = ${JSON.stringify(EXPECTED_MCP_TOOL_RESULT)};
+const EXPECTED_CLIENT_TOOL_ID = ${JSON.stringify(EXPECTED_VSCODE_MCP_TOOL_ID)};
 const MAX_TOOLS = ${MAX_OBSERVED_MCP_TOOLS};
 
 function matchingTools() {
@@ -123,14 +131,17 @@ function matchingTools() {
       && tool.name.length > 0 && tool.name.length <= 240
       && tool.source instanceof McpSource
       && tool.source.label === EXPECTED_SERVER_LABEL
-      && typeof tool.source.name === "string"
-      && tool.source.name.length > 0 && tool.source.name.length <= 240)
+      && tool.source.name === EXPECTED_SERVER_NAME)
     .slice(0, MAX_TOOLS)
     .map((tool) => ({
       name: tool.name,
       sourceLabel: tool.source.label,
       sourceName: tool.source.name
     }));
+}
+
+function toolIdentity(tool) {
+  return JSON.stringify([tool.name, tool.sourceLabel, tool.sourceName]);
 }
 
 async function activate(context) {
@@ -141,7 +152,7 @@ async function activate(context) {
   });
   await consumerInvocation;
   const serverId = "plugin." + vscode.Uri.file(PACKAGE_ROOT).toString() + "." + EXPECTED_SERVER_LABEL;
-  const before = new Set(matchingTools().map((tool) => tool.name));
+  const before = new Set(matchingTools().map(toolIdentity));
   let tools = [];
   for (let attempt = 0; attempt < 40; attempt += 1) {
     await vscode.commands.executeCommand("workbench.mcp.startServer", serverId, {
@@ -152,14 +163,40 @@ async function activate(context) {
     if (tools.length > 0) break;
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
   }
+  const newlyExposedTools = tools.filter((tool) => !before.has(toolIdentity(tool)));
+  const eligibleTools = tools.length === 1
+    && newlyExposedTools.length === 1
+    && tools[0].name === EXPECTED_CLIENT_TOOL_ID
+    ? tools
+    : [];
+  const invocation = { attempted: false, completed: false, resultMatched: false };
+  if (eligibleTools.length === 1) {
+    invocation.attempted = true;
+    try {
+      const result = await vscode.lm.invokeTool(eligibleTools[0].name, {
+        input: {},
+        toolInvocationToken: undefined
+      });
+      invocation.completed = true;
+      invocation.resultMatched = Array.isArray(result && result.content)
+        && result.content.length === 1
+        && result.content[0] instanceof vscode.LanguageModelTextPart
+        && result.content[0].value === EXPECTED_TOOL_RESULT;
+    } catch {
+      // Arbitrary client and tool error details are intentionally discarded.
+    }
+  }
   const evidence = {
     schemaVersion: EVIDENCE_SCHEMA_VERSION,
     expectedServerLabel: EXPECTED_SERVER_LABEL,
+    expectedServerName: EXPECTED_SERVER_NAME,
+    expectedToolName: EXPECTED_TOOL_NAME,
     serverId,
     startCommandCompleted: true,
     matchingToolCount: tools.length,
-    newlyExposedToolCount: tools.filter((tool) => !before.has(tool.name)).length,
-    tools
+    newlyExposedToolCount: newlyExposedTools.length,
+    tools,
+    invocation
   };
   fs.writeFileSync(path.join(context.extensionPath, EVIDENCE_FILENAME), JSON.stringify(evidence), {
     encoding: "utf8",
@@ -416,7 +453,7 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
     try {
       const versionObservation = await this.#readVersion(state, context.signal);
       if (!versionObservation) {
-        return loadOnlyOutput("unknown", "unknown", undefined, [
+        const evidenceItems = [
           evidence(
             "APCI-CLIENT-VSCODE-REGISTER-001",
             "vscode/local-registration",
@@ -427,7 +464,19 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
             "vscode/version",
             "No bounded recognizable VS Code version was available from a trusted version source, so client loading was not attempted."
           )
-        ]);
+        ];
+        if (state.mcpTargetName) {
+          return mcpUnavailableOutput("unknown", undefined, [
+            ...evidenceItems,
+            evidence(
+              "APCI-CLIENT-VSCODE-MCP-OBSERVED-003",
+              "vscode/observer-api",
+              "The target VS Code version or client load was unavailable; startup, handshake, and tool exposure remain unknown."
+            ),
+            toolInvocationEvidence("unknown")
+          ], true);
+        }
+        return loadOnlyOutput("unknown", "unknown", undefined, evidenceItems);
       }
 
       const args = [
@@ -492,7 +541,7 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
             : evidence(
               "APCI-CLIENT-VSCODE-MCP-DISABLED-001",
               "vscode/settings",
-              "The isolated observation session set chat.mcp.access to none; MCP startup, handshake, and tool exposure were not assessed."
+              "The isolated observation session set chat.mcp.access to none; MCP startup, handshake, tool exposure, and tool invocation were not assessed."
             ),
           evidence(
             "APCI-CLIENT-VSCODE-VERSION-001",
@@ -538,9 +587,33 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
         );
       }
 
+      if (clientLoad !== "observed") {
+        evidenceItems.push(
+          evidence(
+            "APCI-CLIENT-VSCODE-MCP-OBSERVED-003",
+            "vscode/observer-api",
+            "The target VS Code version or client load was unavailable; startup, handshake, and tool exposure remain unknown."
+          ),
+          toolInvocationEvidence("unknown")
+        );
+        return mcpUnavailableOutput(
+          clientLoad,
+          versionObservation.version,
+          evidenceItems,
+          observerActivated
+        );
+      }
+
       const mcpObservation = observerActivated
         ? await validateMcpObserverEvidence(state)
-        : { status: "unknown" as const, matchingToolCount: 0, newlyExposedToolCount: 0 };
+        : {
+          status: "unknown" as const,
+          matchingToolCount: 0,
+          newlyExposedToolCount: 0,
+          invocationAttempted: false,
+          invocationCompleted: false,
+          invocationResultMatched: false
+        };
       evidenceItems.push(mcpObservation.status === "observed"
         ? evidence(
           "APCI-CLIENT-VSCODE-MCP-OBSERVED-001",
@@ -556,10 +629,23 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
             ? "The trusted VS Code observer completed without an exactly attributable MCP tool; startup, handshake, and tool exposure were not observed."
             : "The trusted VS Code observer did not produce valid bounded MCP evidence; no MCP lifecycle claim was made."
         ));
+      const toolInvocation = mcpObservation.invocationAttempted
+        && mcpObservation.invocationCompleted
+        && mcpObservation.invocationResultMatched
+        ? "observed" as const
+        : mcpObservation.status === "unknown"
+          ? "unknown" as const
+          : "not-observed" as const;
+      evidenceItems.push(toolInvocationEvidence(
+        toolInvocation,
+        mcpObservation.invocationAttempted,
+        mcpObservation.invocationCompleted
+      ));
       return clientMcpOutput(
-        observed && mcpObservation.status === "observed" ? "pass" : "unknown",
+        observed && mcpObservation.status === "observed" && toolInvocation === "observed" ? "pass" : "unknown",
         clientLoad,
         mcpObservation.status,
+        toolInvocation,
         versionObservation.version,
         evidenceItems,
         observerActivated
@@ -1264,13 +1350,30 @@ async function validateMcpObserverEvidence(state: AdapterState): Promise<{
   status: "observed" | "not-observed" | "unknown";
   matchingToolCount: number;
   newlyExposedToolCount: number;
+  invocationAttempted: boolean;
+  invocationCompleted: boolean;
+  invocationResultMatched: boolean;
 }> {
   if (!state.mcpTargetName) {
-    return { status: "unknown", matchingToolCount: 0, newlyExposedToolCount: 0 };
+    return {
+      status: "unknown",
+      matchingToolCount: 0,
+      newlyExposedToolCount: 0,
+      invocationAttempted: false,
+      invocationCompleted: false,
+      invocationResultMatched: false
+    };
   }
   const evidenceInfo = await lstatIfPresent(state.observerMcpEvidence);
   if (!evidenceInfo) {
-    return { status: "unknown", matchingToolCount: 0, newlyExposedToolCount: 0 };
+    return {
+      status: "unknown",
+      matchingToolCount: 0,
+      newlyExposedToolCount: 0,
+      invocationAttempted: false,
+      invocationCompleted: false,
+      invocationResultMatched: false
+    };
   }
   if (state.observerMcpEvidence !== join(state.observerRoot, OBSERVER_MCP_EVIDENCE_FILENAME)
     || !isWithin(state.tempRoot, state.observerMcpEvidence)
@@ -1304,8 +1407,22 @@ async function validateMcpObserverEvidence(state: AdapterState): Promise<{
     throw new Error("VS Code observer MCP evidence was not valid JSON");
   }
   if (!isRecord(parsed)
+    || !hasExactKeys(parsed, [
+      "schemaVersion",
+      "expectedServerLabel",
+      "expectedServerName",
+      "expectedToolName",
+      "serverId",
+      "startCommandCompleted",
+      "matchingToolCount",
+      "newlyExposedToolCount",
+      "tools",
+      "invocation"
+    ])
     || parsed.schemaVersion !== OBSERVER_MCP_EVIDENCE_SCHEMA_VERSION
     || parsed.expectedServerLabel !== state.mcpTargetName
+    || parsed.expectedServerName !== EXPECTED_MCP_SERVER_NAME
+    || parsed.expectedToolName !== EXPECTED_MCP_TOOL_NAME
     || typeof parsed.serverId !== "string"
     || !validExpectedMcpServerId(parsed.serverId, state.packageRoot, state.mcpTargetName)
     || parsed.startCommandCompleted !== true
@@ -1314,30 +1431,49 @@ async function validateMcpObserverEvidence(state: AdapterState): Promise<{
     || !Array.isArray(parsed.tools)
     || parsed.tools.length > MAX_OBSERVED_MCP_TOOLS
     || parsed.matchingToolCount !== parsed.tools.length
+    || (parsed.matchingToolCount as number) < 0
+    || (parsed.matchingToolCount as number) > MAX_OBSERVED_MCP_TOOLS
     || (parsed.newlyExposedToolCount as number) < 0
-    || (parsed.newlyExposedToolCount as number) > parsed.tools.length) {
+    || (parsed.newlyExposedToolCount as number) > parsed.tools.length
+    || !isRecord(parsed.invocation)
+    || !hasExactKeys(parsed.invocation, ["attempted", "completed", "resultMatched"])
+    || typeof parsed.invocation.attempted !== "boolean"
+    || typeof parsed.invocation.completed !== "boolean"
+    || typeof parsed.invocation.resultMatched !== "boolean") {
     throw new Error("VS Code observer MCP evidence did not match its bounded contract");
   }
   const toolNames = new Set<string>();
-  const sourceNames = new Set<string>();
   for (const rawTool of parsed.tools) {
     if (!isRecord(rawTool)
+      || !hasExactKeys(rawTool, ["name", "sourceLabel", "sourceName"])
       || typeof rawTool.name !== "string" || !validObserverText(rawTool.name)
       || rawTool.sourceLabel !== state.mcpTargetName
-      || typeof rawTool.sourceName !== "string" || !validObserverText(rawTool.sourceName)
+      || rawTool.sourceName !== EXPECTED_MCP_SERVER_NAME
       || toolNames.has(rawTool.name)) {
       throw new Error("VS Code observer MCP tool evidence was malformed or ambiguous");
     }
     toolNames.add(rawTool.name);
-    sourceNames.add(rawTool.sourceName);
   }
-  if (sourceNames.size > 1) throw new Error("VS Code observer MCP tool evidence was malformed or ambiguous");
   const matchingToolCount = parsed.matchingToolCount as number;
   const newlyExposedToolCount = parsed.newlyExposedToolCount as number;
+  const invocationAttempted = parsed.invocation.attempted;
+  const invocationCompleted = parsed.invocation.completed;
+  const invocationResultMatched = parsed.invocation.resultMatched;
+  const invocationEligible = matchingToolCount === 1
+    && newlyExposedToolCount === 1
+    && toolNames.has(EXPECTED_VSCODE_MCP_TOOL_ID);
+  if (invocationAttempted !== invocationEligible
+    || invocationCompleted && !invocationAttempted
+    || invocationResultMatched && !invocationCompleted) {
+    throw new Error("VS Code observer MCP invocation evidence was malformed or ambiguous");
+  }
   return {
     status: matchingToolCount > 0 && newlyExposedToolCount > 0 ? "observed" : "not-observed",
     matchingToolCount,
-    newlyExposedToolCount
+    newlyExposedToolCount,
+    invocationAttempted,
+    invocationCompleted,
+    invocationResultMatched
   };
 }
 
@@ -1713,6 +1849,28 @@ function loadOnlyOutput(
     mcpStartup: "not-assessed",
     mcpHandshake: "not-assessed",
     toolExposure: "not-assessed",
+    toolInvocation: "not-assessed",
+    interoperability: "not-established",
+    ...(targetClientVersion ? { targetClientVersion } : {}),
+    evidence: evidenceItems
+  };
+}
+
+function mcpUnavailableOutput(
+  clientLoad: ClientRuntimeAdapterOutput["clientLoad"],
+  targetClientVersion: string | undefined,
+  evidenceItems: ClientRuntimeAdapterOutput["evidence"],
+  complete: boolean
+): ClientRuntimeAdapterOutput {
+  return {
+    status: "unknown",
+    complete,
+    packageInstall: "not-observed",
+    clientLoad,
+    mcpStartup: "unknown",
+    mcpHandshake: "unknown",
+    toolExposure: "unknown",
+    toolInvocation: "unknown",
     interoperability: "not-established",
     ...(targetClientVersion ? { targetClientVersion } : {}),
     evidence: evidenceItems
@@ -1723,6 +1881,7 @@ function clientMcpOutput(
   status: ClientRuntimeAdapterOutput["status"],
   clientLoad: ClientRuntimeAdapterOutput["clientLoad"],
   mcpObservation: "observed" | "not-observed" | "unknown",
+  toolInvocation: "observed" | "not-observed" | "unknown",
   targetClientVersion: string,
   evidenceItems: ClientRuntimeAdapterOutput["evidence"],
   complete: boolean
@@ -1735,10 +1894,39 @@ function clientMcpOutput(
     mcpStartup: mcpObservation,
     mcpHandshake: mcpObservation,
     toolExposure: mcpObservation,
+    toolInvocation,
     interoperability: "not-established",
     targetClientVersion,
     evidence: evidenceItems
   };
+}
+
+function toolInvocationEvidence(
+  status: "observed" | "not-observed" | "unknown",
+  attempted = false,
+  completed = false
+) {
+  return status === "observed"
+    ? evidence(
+      "APCI-CLIENT-VSCODE-TOOL-INVOKED-001",
+      "vscode/observer-api/tool-invocation",
+      "VS Code invoked the one eligible newly exposed tool through vscode.lm.invokeTool and exact bounded deterministic result matched."
+    )
+    : status === "not-observed"
+      ? evidence(
+        "APCI-CLIENT-VSCODE-TOOL-INVOKED-002",
+        "vscode/observer-api/tool-invocation",
+        !attempted
+          ? "No uniquely eligible newly exposed tool was invoked."
+          : !completed
+            ? "VS Code did not complete the bounded tool invocation; arbitrary client/tool error details were discarded."
+            : "VS Code completed the bounded tool invocation, but the exact deterministic result did not match."
+      )
+      : evidence(
+        "APCI-CLIENT-VSCODE-TOOL-INVOKED-003",
+        "vscode/observer-api/tool-invocation",
+        "The trusted VS Code observer did not produce valid bounded tool invocation evidence; no tool invocation claim was made."
+      );
 }
 
 function evidence(code: string, location: string, summary: string) {
@@ -1759,4 +1947,10 @@ function isWithin(root: string, candidate: string): boolean {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const keys = Object.keys(value).sort();
+  return keys.length === expected.length
+    && [...expected].sort().every((key, index) => keys[index] === key);
 }

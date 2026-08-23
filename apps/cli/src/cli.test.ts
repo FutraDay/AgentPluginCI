@@ -481,7 +481,7 @@ describe("Agent Plugin CI CLI", () => {
     expect(textCap.stdout.some((line) => line.startsWith("CLIENT_RUNTIME_PASS"))).toBe(true);
     expect(textCap.stdout).toContain("CLIENT_RUNTIME_SCOPE client-adapter-harness complete=true synthetic=true interoperability=not-established");
     expect(textCap.stdout).toContain(
-      "CLIENT_OBSERVATIONS install=observed load=observed mcp-startup=not-assessed mcp-handshake=not-assessed tool-exposure=not-assessed finalize=complete"
+      "CLIENT_OBSERVATIONS install=observed load=observed mcp-startup=not-assessed mcp-handshake=not-assessed tool-exposure=not-assessed tool-invocation=not-assessed finalize=complete"
     );
   });
 
@@ -574,6 +574,7 @@ describe("Agent Plugin CI CLI", () => {
       mcpStartup: "not-assessed",
       mcpHandshake: "not-assessed",
       toolExposure: "not-assessed",
+      toolInvocation: "not-assessed",
       interoperability: "not-established"
     });
   });

@@ -981,7 +981,7 @@ function renderClientRuntimeCompatibility(
   write(`CLIENT_RUNTIME_SCOPE ${payload.scope} complete=${payload.execution.complete} synthetic=${payload.synthetic} interoperability=${payload.interoperability}`);
   write(`CLIENT_ADAPTER ${payload.adapter.id}@${payload.adapter.version}`);
   write(`TARGET_CLIENT ${payload.targetClient.id}${payload.targetClient.version ? `@${payload.targetClient.version}` : "@unknown"}`);
-  write(`CLIENT_OBSERVATIONS install=${payload.packageInstall} load=${payload.clientLoad} mcp-startup=${payload.mcpStartup} mcp-handshake=${payload.mcpHandshake} tool-exposure=${payload.toolExposure} finalize=${payload.execution.finalize}`);
+  write(`CLIENT_OBSERVATIONS install=${payload.packageInstall} load=${payload.clientLoad} mcp-startup=${payload.mcpStartup} mcp-handshake=${payload.mcpHandshake} tool-exposure=${payload.toolExposure} tool-invocation=${payload.toolInvocation} finalize=${payload.execution.finalize}`);
   for (const item of payload.evidence) write(`[${item.code}] ${sanitizeConsoleText(item.summary)}`);
   write(`NOTE ${sanitizeConsoleText(payload.note)}`);
 }
@@ -1103,7 +1103,7 @@ Runtime compatibility options:
   --client-adapter <id>           Use synthetic-fixture or real vscode-github-copilot (MCP disabled by default)
   --client-executable <path>      Required absolute VS Code executable path for vscode-github-copilot
   --allow-client-runtime          Explicitly permit the selected client adapter lifecycle
-  --allow-client-mcp-runtime      Additionally permit one preflighted stdio server through VS Code (default: denied)
+  --allow-client-mcp-runtime      Permit one preflighted stdio server and eligible deterministic tool invocation through VS Code (default: denied)
   --allow-client-package-read     Grant the selected adapter bounded package-root read access
   --allow-client-process          Grant the selected adapter direct client process execution
   --allow-client-filesystem       Grant isolated client state/log filesystem access

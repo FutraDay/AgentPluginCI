@@ -81,6 +81,7 @@ function successOutput(evidence: ClientRuntimeAdapterOutput["evidence"]): Client
     mcpStartup: "not-assessed",
     mcpHandshake: "not-assessed",
     toolExposure: "not-assessed",
+    toolInvocation: "not-assessed",
     interoperability: "not-established",
     targetClientVersion: "0.0.0-fixture",
     evidence

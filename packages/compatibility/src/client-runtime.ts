@@ -1,4 +1,4 @@
-export const CLIENT_RUNTIME_REPORT_SCHEMA_VERSION = "1.1.0";
+export const CLIENT_RUNTIME_REPORT_SCHEMA_VERSION = "1.2.0";
 export const CLIENT_RUNTIME_EVIDENCE_LEVEL = "client-runtime-observation" as const;
 export const CLIENT_RUNTIME_SCOPE = "client-adapter-harness" as const;
 
@@ -82,6 +82,7 @@ export interface ClientRuntimeAdapterOutput {
   mcpStartup: ClientRuntimeObservationStatus;
   mcpHandshake: ClientRuntimeObservationStatus;
   toolExposure: ClientRuntimeObservationStatus;
+  toolInvocation: ClientRuntimeObservationStatus;
   interoperability: ClientRuntimeInteroperability;
   targetClientVersion?: string;
   evidence: readonly ClientRuntimeEvidence[];
@@ -125,6 +126,7 @@ export interface ClientRuntimeReport {
   mcpStartup: ClientRuntimeObservationStatus;
   mcpHandshake: ClientRuntimeObservationStatus;
   toolExposure: ClientRuntimeObservationStatus;
+  toolInvocation: ClientRuntimeObservationStatus;
   interoperability: ClientRuntimeInteroperability;
   evidence: ClientRuntimeEvidence[];
   note: string;
@@ -282,7 +284,8 @@ export async function runClientRuntimeHarness(
     normalized?.targetClientVersion,
     normalized?.mcpStartup ?? "unknown",
     normalized?.mcpHandshake ?? "unknown",
-    normalized?.toolExposure ?? "unknown"
+    normalized?.toolExposure ?? "unknown",
+    normalized?.toolInvocation ?? "unknown"
   );
 }
 
@@ -330,7 +333,7 @@ function normalizeAdapterOutput(raw: unknown): ClientRuntimeAdapterOutput {
     if (!isExecutionResult(raw.status) || typeof raw.complete !== "boolean") throw new Error();
     if (!isObservation(raw.packageInstall) || !isObservation(raw.clientLoad)
       || !isObservation(raw.mcpStartup) || !isObservation(raw.mcpHandshake)
-      || !isObservation(raw.toolExposure)) throw new Error();
+      || !isObservation(raw.toolExposure) || !isObservation(raw.toolInvocation)) throw new Error();
     if (raw.interoperability !== "established" && raw.interoperability !== "not-established") throw new Error();
     if (raw.targetClientVersion !== undefined && !safeVersion(raw.targetClientVersion)) throw new Error();
     if (!Array.isArray(raw.evidence) || raw.evidence.length > MAX_EVIDENCE_INPUT_ITEMS) throw new Error();
@@ -343,6 +346,7 @@ function normalizeAdapterOutput(raw: unknown): ClientRuntimeAdapterOutput {
       mcpStartup: raw.mcpStartup,
       mcpHandshake: raw.mcpHandshake,
       toolExposure: raw.toolExposure,
+      toolInvocation: raw.toolInvocation,
       interoperability: raw.interoperability,
       ...(raw.targetClientVersion ? { targetClientVersion: raw.targetClientVersion } : {}),
       evidence: boundedEvidence(items)
@@ -400,7 +404,8 @@ function baseReport(
   targetClientVersion?: string,
   mcpStartup: ClientRuntimeObservationStatus = "not-assessed",
   mcpHandshake: ClientRuntimeObservationStatus = "not-assessed",
-  toolExposure: ClientRuntimeObservationStatus = "not-assessed"
+  toolExposure: ClientRuntimeObservationStatus = "not-assessed",
+  toolInvocation: ClientRuntimeObservationStatus = "not-assessed"
 ): ClientRuntimeReport {
   const targetClient = {
     ...metadata.targetClient,
@@ -421,6 +426,7 @@ function baseReport(
     mcpStartup,
     mcpHandshake,
     toolExposure,
+    toolInvocation,
     interoperability,
     evidence: boundedEvidence(items),
     note: metadata.synthetic
