@@ -1,5 +1,18 @@
 import { spawn as nodeSpawn, type SpawnOptions } from "node:child_process";
-import { constants, lstat, mkdir, mkdtemp, open, opendir, realpath, rm, writeFile } from "node:fs/promises";
+import {
+  constants,
+  link,
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  opendir,
+  readlink,
+  realpath,
+  rm,
+  symlink,
+  writeFile
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
@@ -21,12 +34,14 @@ export const VSCODE_CLIENT_RUNTIME_REQUIRED_CAPABILITIES = Object.freeze([
   "network"
 ] as const);
 
-const ADAPTER_VERSION = "1.1.0";
+const ADAPTER_VERSION = "1.2.0";
 const MIN_OBSERVATION_MS = 100;
 const MAX_OBSERVATION_MS = 20_000;
-const DEFAULT_OBSERVATION_MS = 2_500;
+const DEFAULT_OBSERVATION_MS = 7_500;
 const VERSION_TIMEOUT_MS = 2_000;
 const TERMINATION_TIMEOUT_MS = 750;
+const TERMINATION_SETTLE_MS = 500;
+const TEMP_CLEANUP_ATTEMPTS = 4;
 const MAX_PATH_LENGTH = 4_096;
 const MAX_PROCESS_OUTPUT_BYTES = 128 * 1024;
 const MAX_LOG_BYTES = 512 * 1024;
@@ -38,6 +53,41 @@ const MAX_PACKAGE_DEPTH = 16;
 const MAX_WINDOWS_LAUNCHER_BYTES = 8 * 1024;
 const MAX_WINDOWS_BUNDLED_CLI_BYTES = 16 * 1024 * 1024;
 const TEMP_PREFIX = "agentplugin-vscode-";
+const SHADOW_DIRECTORY = "client-shadow";
+const SHADOW_EXECUTABLE = "Code.exe";
+const OBSERVER_DIRECTORY = "agent-plugin-ci.agent-plugin-ci-runtime-observer-1.0.0";
+const OBSERVER_EXTENSION_ID = "agent-plugin-ci.agent-plugin-ci-runtime-observer";
+const OBSERVER_MARKER_FILENAME = "consumer-surface-exercised.marker";
+const OBSERVER_MARKER_CONTENT = "agent-plugin-ci:consumer-surface-exercised:v1\n";
+const OBSERVER_MANIFEST = `${JSON.stringify({
+  name: "agent-plugin-ci-runtime-observer",
+  displayName: "Agent Plugin CI Runtime Observer",
+  description: "Activates a trusted built-in VS Code Agent Plugin consumer surface in an isolated runtime evidence session.",
+  version: "1.0.0",
+  publisher: "agent-plugin-ci",
+  engines: { vscode: "^1.100.0" },
+  main: "./extension.js",
+  activationEvents: ["*"]
+}, null, 2)}\n`;
+const OBSERVER_SOURCE = `"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const vscode = require("vscode");
+
+const MARKER_FILENAME = ${JSON.stringify(OBSERVER_MARKER_FILENAME)};
+const MARKER_CONTENT = ${JSON.stringify(OBSERVER_MARKER_CONTENT)};
+
+async function activate(context) {
+  const consumerInvocation = vscode.commands.executeCommand("aiCustomization.openManagementEditor");
+  fs.writeFileSync(path.join(context.extensionPath, MARKER_FILENAME), MARKER_CONTENT, {
+    encoding: "utf8",
+    flag: "wx"
+  });
+  await consumerInvocation;
+}
+
+exports.activate = activate;
+`;
 
 interface RuntimeChildProcess {
   readonly pid?: number;
@@ -62,6 +112,8 @@ export interface VscodeClientRuntimeDependencies {
   readonly platform: NodeJS.Platform;
   readonly environment: NodeJS.ProcessEnv;
   tempDirectory(): string;
+  linkFile(existingPath: string, newPath: string): Promise<void>;
+  createJunction(target: string, path: string): Promise<void>;
 }
 
 export interface VscodeClientRuntimeAdapterOptions {
@@ -77,6 +129,8 @@ interface AdapterState {
   tempRoot: string;
   userDataDir: string;
   extensionsDir: string;
+  observerRoot: string;
+  observerMarker: string;
   homeDir: string;
   observationFile: string;
   environment: NodeJS.ProcessEnv;
@@ -85,6 +139,42 @@ interface AdapterState {
 interface VersionObservation {
   version: string;
   source: "bundled-cli" | "direct-executable";
+  windowsBundledLayout?: WindowsBundledLayout;
+}
+
+interface WindowsBundledCliResolution {
+  cliPath: string;
+  shadowLayout?: WindowsBundledLayout;
+}
+
+interface WindowsBundledLayout {
+  installationRoot: string;
+  installationRootIdentity: FileIdentity;
+  executablePath: string;
+  executableIdentity: FileIdentity & { size: number };
+  launcherPath: string;
+  launcherIdentity: FileIdentity & { size: number };
+  cliPath: string;
+  cliIdentity: FileIdentity & { size: number };
+  versionDirectoryName: string;
+  versionDirectory: string;
+  versionDirectoryIdentity: FileIdentity;
+}
+
+interface FileIdentity {
+  dev: number;
+  ino: number;
+}
+
+interface ParsedWindowsBundledCliLauncher {
+  relativeCliPath: string;
+  versionDirectoryName?: string;
+}
+
+interface PreparedGuiLauncher {
+  executablePath: string;
+  argsPrefix: readonly string[];
+  environment: NodeJS.ProcessEnv;
 }
 
 type ExitResult =
@@ -110,7 +200,13 @@ const DEFAULT_DEPENDENCIES: VscodeClientRuntimeDependencies = {
   },
   platform: process.platform,
   environment: process.env,
-  tempDirectory: tmpdir
+  tempDirectory: tmpdir,
+  linkFile(existingPath, newPath) {
+    return link(existingPath, newPath);
+  },
+  createJunction(target, path) {
+    return symlink(target, path, "junction");
+  }
 };
 
 export function createVscodeClientRuntimeAdapter(options: VscodeClientRuntimeAdapterOptions): ClientRuntimeAdapter {
@@ -157,6 +253,8 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
     const tempRoot = await mkdtemp(join(tempBase, TEMP_PREFIX));
     const userDataDir = join(tempRoot, "user-data");
     const extensionsDir = join(tempRoot, "extensions");
+    const observerRoot = join(extensionsDir, OBSERVER_DIRECTORY);
+    const observerMarker = join(observerRoot, OBSERVER_MARKER_FILENAME);
     const homeDir = join(tempRoot, "home");
     const observationFile = join(tempRoot, "observation.txt");
     const directories = [
@@ -171,11 +269,14 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
       tempRoot,
       userDataDir,
       extensionsDir,
+      observerRoot,
+      observerMarker,
       homeDir,
       observationFile,
       environment: isolatedEnvironment(this.#dependencies.environment, tempRoot, homeDir)
     };
     for (const directory of directories) await mkdir(directory, { recursive: true });
+    await materializeObserver(tempRoot, extensionsDir, observerRoot);
 
     const settings = {
       "chat.plugins.enabled": true,
@@ -219,54 +320,94 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
       const args = [
         "--user-data-dir", state.userDataDir,
         "--extensions-dir", state.extensionsDir,
+        "--extensionDevelopmentPath", state.observerRoot,
         "--disable-telemetry",
         "--disable-updates",
         "--password-store=basic",
         "--skip-welcome",
         "--skip-release-notes",
         "--new-window",
+        "--log", "trace",
         "--verbose",
         "--wait",
         state.observationFile
       ];
-      const launched = launchProcess(this.#dependencies, state.executablePath, args, state.environment, state.tempRoot, true);
+      await validateObserverMaterialization(state.tempRoot, state.extensionsDir, state.observerRoot, true);
+      const guiLauncher = await prepareWindowsShadowLauncher(
+        this.#dependencies,
+        state,
+        versionObservation.windowsBundledLayout
+      ).catch(() => directGuiLauncher(state));
+      const launched = launchProcess(
+        this.#dependencies,
+        guiLauncher.executablePath,
+        [...guiLauncher.argsPrefix, ...args],
+        guiLauncher.environment,
+        state.tempRoot,
+        true
+      );
       this.#active = launched;
       await waitForObservation(launched.exit, this.#observationWindowMs, context.signal);
       await this.#stopActive();
 
-      const clientEvidence = `${launched.output()}\n${await collectVscodeLogs(state.userDataDir)}`;
-      const matches = qualifyingLoadRecords(clientEvidence, state.packageRoot);
-      const observed = matches > 0;
-      return loadOnlyOutput(observed ? "pass" : "unknown", observed ? "observed" : "not-observed", versionObservation.version, [
-        evidence(
-          "APCI-CLIENT-VSCODE-REGISTER-001",
-          "vscode/local-registration",
-          "The package was registered through isolated chat.pluginLocations; local registration is not package installation."
-        ),
-        evidence(
-          "APCI-CLIENT-VSCODE-MCP-DISABLED-001",
-          "vscode/settings",
-          "The isolated observation session set chat.mcp.access to none; MCP startup, handshake, and tool exposure were not assessed."
-        ),
-        evidence(
-          "APCI-CLIENT-VSCODE-VERSION-001",
-          "vscode/version",
-          versionObservation.source === "bundled-cli"
-            ? "The target client version was obtained through VS Code's validated bundled CLI entrypoint using a bounded direct process invocation."
-            : "The target client version was obtained through a bounded direct executable invocation."
-        ),
-        observed
-          ? evidence(
-            "APCI-CLIENT-VSCODE-LOAD-001",
-            "vscode/client-evidence",
-            `VS Code emitted ${matches} bounded discovery/read/watch record(s) referencing the registered package root or its manifest/skills.`
-          )
-          : evidence(
-            "APCI-CLIENT-VSCODE-LOAD-002",
-            "vscode/client-evidence",
-            "No qualifying bounded VS Code discovery/read/watch record referenced the registered package root or its manifest/skills; client loading was not observed."
-          )
-      ]);
+      // Drain bounded process output, but never use arbitrary process text as package-load evidence.
+      launched.output();
+      const observerActivated = await validateObserverMarker(state.tempRoot, state.observerRoot, state.observerMarker);
+      const trustedClientLogs = await collectVscodeLogs(state.userDataDir);
+      const matches = observerActivated ? qualifyingLoadRecords(trustedClientLogs, state.packageRoot) : 0;
+      const observed = observerActivated && matches > 0;
+      const clientLoad = !observerActivated ? "unknown" : observed ? "observed" : "not-observed";
+      return loadOnlyOutput(
+        observed ? "pass" : "unknown",
+        clientLoad,
+        versionObservation.version,
+        [
+          evidence(
+            "APCI-CLIENT-VSCODE-REGISTER-001",
+            "vscode/local-registration",
+            "The package was registered through isolated chat.pluginLocations; local registration is not package installation."
+          ),
+          evidence(
+            "APCI-CLIENT-VSCODE-MCP-DISABLED-001",
+            "vscode/settings",
+            "The isolated observation session set chat.mcp.access to none; MCP startup, handshake, and tool exposure were not assessed."
+          ),
+          evidence(
+            "APCI-CLIENT-VSCODE-VERSION-001",
+            "vscode/version",
+            versionObservation.source === "bundled-cli"
+              ? "The target client version was obtained through VS Code's validated bundled CLI entrypoint using a bounded direct process invocation."
+              : "The target client version was obtained through a bounded direct executable invocation."
+          ),
+          observerActivated
+            ? evidence(
+              "APCI-CLIENT-VSCODE-OBSERVER-001",
+              "vscode/observer",
+              "The isolated Agent Plugin CI observer activated and dispatched the trusted built-in AI customization management command."
+            )
+            : evidence(
+              "APCI-CLIENT-VSCODE-OBSERVER-002",
+              "vscode/observer",
+              "The isolated observer did not prove activation and dispatch of the trusted built-in AI customization management command; client loading was not assessed."
+            ),
+          observed
+            ? evidence(
+              "APCI-CLIENT-VSCODE-LOAD-001",
+              "vscode/client-logs",
+              `VS Code emitted ${matches} bounded client-owned file-watcher start record(s) referencing the exact registered package root or a contained portable component.`
+            )
+            : observerActivated ? evidence(
+              "APCI-CLIENT-VSCODE-LOAD-002",
+              "vscode/client-logs",
+              "No qualifying bounded VS Code-owned file-watcher start record referenced the exact registered package root or a contained portable component; client loading was not observed."
+            ) : evidence(
+              "APCI-CLIENT-VSCODE-LOAD-003",
+              "vscode/client-logs",
+              "No package-loading claim was made because observer activation was not proven."
+            )
+        ],
+        observerActivated
+      );
     } catch (error) {
       await this.#stopActive();
       throw error;
@@ -280,16 +421,34 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
 
   async #readVersion(state: AdapterState, signal: AbortSignal): Promise<VersionObservation | undefined> {
     if (this.#dependencies.platform === "win32") {
-      const bundledCliPath = await resolveWindowsBundledCli(state.executablePath);
-      if (bundledCliPath) {
+      const bundledCli = await resolveWindowsBundledCli(state.executablePath);
+      if (bundledCli) {
         const bundledVersion = await this.#probeVersion(
           state,
-          [bundledCliPath, "--user-data-dir", state.userDataDir, "--extensions-dir", state.extensionsDir, "--version"],
+          [bundledCli.cliPath, "--user-data-dir", state.userDataDir, "--extensions-dir", state.extensionsDir, "--version"],
           { ...state.environment, ELECTRON_RUN_AS_NODE: "1" },
           signal,
           true
         );
-        if (bundledVersion) return { version: bundledVersion, source: "bundled-cli" };
+        if (bundledVersion) {
+          return {
+            version: bundledVersion,
+            source: "bundled-cli",
+            ...(bundledCli.shadowLayout ? { windowsBundledLayout: bundledCli.shadowLayout } : {})
+          };
+        }
+        const directVersion = await this.#probeVersion(
+          state,
+          ["--user-data-dir", state.userDataDir, "--extensions-dir", state.extensionsDir, "--version"],
+          state.environment,
+          signal,
+          false
+        );
+        return directVersion ? {
+          version: directVersion,
+          source: "direct-executable",
+          ...(bundledCli.shadowLayout ? { windowsBundledLayout: bundledCli.shadowLayout } : {})
+        } : undefined;
       }
     }
     const directVersion = await this.#probeVersion(
@@ -346,19 +505,24 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
     const state = this.#state;
     if (!state) return;
     this.#state = undefined;
-    if (!safeTemporaryRoot(state.tempBase, state.tempRoot)) {
-      throw new Error("VS Code adapter refused unsafe temporary cleanup target");
+    for (let attempt = 0; attempt < TEMP_CLEANUP_ATTEMPTS; attempt += 1) {
+      if (!safeTemporaryRoot(state.tempBase, state.tempRoot)) {
+        throw new Error("VS Code adapter refused unsafe temporary cleanup target");
+      }
+      const rootInfo = await lstatIfPresent(state.tempRoot);
+      if (!rootInfo) return;
+      if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
+        throw new Error("VS Code adapter refused altered temporary cleanup target");
+      }
+      const canonicalRoot = await realpath(state.tempRoot);
+      if (!safeTemporaryRoot(state.tempBase, canonicalRoot)) {
+        throw new Error("VS Code adapter refused escaped temporary cleanup target");
+      }
+      await rm(state.tempRoot, { recursive: true, force: true, maxRetries: 2, retryDelay: 50 });
+      if (!await lstatIfPresent(state.tempRoot)) return;
+      await delay(50 * (attempt + 1));
     }
-    const rootInfo = await lstat(state.tempRoot).catch(() => undefined);
-    if (!rootInfo) return;
-    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
-      throw new Error("VS Code adapter refused altered temporary cleanup target");
-    }
-    const canonicalRoot = await realpath(state.tempRoot);
-    if (!safeTemporaryRoot(state.tempBase, canonicalRoot)) {
-      throw new Error("VS Code adapter refused escaped temporary cleanup target");
-    }
-    await rm(state.tempRoot, { recursive: true, force: true, maxRetries: 2, retryDelay: 50 });
+    throw new Error("VS Code adapter could not remove isolated temporary state within bounds");
   }
 }
 
@@ -379,7 +543,7 @@ async function validateExecutablePath(raw: string, platform: NodeJS.Platform): P
   return await realpath(raw);
 }
 
-async function resolveWindowsBundledCli(executablePath: string): Promise<string | undefined> {
+async function resolveWindowsBundledCli(executablePath: string): Promise<WindowsBundledCliResolution | undefined> {
   try {
     if (basename(executablePath).toLowerCase() !== "code.exe") return undefined;
     const installationRoot = dirname(executablePath);
@@ -390,28 +554,253 @@ async function resolveWindowsBundledCli(executablePath: string): Promise<string 
 
     const launcherPath = await validateContainedRegularFile(canonicalRoot, ["bin", "code.cmd"]);
     const launcher = await readBoundedTrustedFile(launcherPath, canonicalRoot, MAX_WINDOWS_LAUNCHER_BYTES);
-    const relativeCliPath = parseWindowsBundledCliLauncher(launcher);
-    if (!relativeCliPath) return undefined;
-    return await validateContainedRegularFile(
+    const parsedLauncher = parseWindowsBundledCliLauncher(launcher);
+    if (!parsedLauncher) return undefined;
+    const cliPath = await validateContainedRegularFile(
       canonicalRoot,
-      relativeCliPath.split("\\"),
+      parsedLauncher.relativeCliPath.split("\\"),
       MAX_WINDOWS_BUNDLED_CLI_BYTES
     );
+    const canonicalExecutable = await validateContainedRegularFile(canonicalRoot, [SHADOW_EXECUTABLE]);
+    if (!sameCanonicalPath(canonicalExecutable, executablePath, "win32")) return undefined;
+    if (!parsedLauncher.versionDirectoryName) return { cliPath };
+    const versionDirectory = await validateContainedDirectory(
+      canonicalRoot,
+      [parsedLauncher.versionDirectoryName]
+    );
+    return {
+      cliPath,
+      shadowLayout: {
+        installationRoot: canonicalRoot,
+        installationRootIdentity: fileIdentity(await lstat(canonicalRoot)),
+        executablePath: canonicalExecutable,
+        executableIdentity: fileIdentityWithSize(await lstat(canonicalExecutable)),
+        launcherPath,
+        launcherIdentity: fileIdentityWithSize(await lstat(launcherPath)),
+        cliPath,
+        cliIdentity: fileIdentityWithSize(await lstat(cliPath)),
+        versionDirectoryName: parsedLauncher.versionDirectoryName,
+        versionDirectory,
+        versionDirectoryIdentity: fileIdentity(await lstat(versionDirectory))
+      }
+    };
   } catch {
     return undefined;
   }
 }
 
-function parseWindowsBundledCliLauncher(raw: string): string | undefined {
+function parseWindowsBundledCliLauncher(raw: string): ParsedWindowsBundledCliLauncher | undefined {
   if (raw.includes("\u0000") || raw.includes("\r") && !raw.includes("\r\n")) return undefined;
   const normalized = raw.replaceAll("\r\n", "\n");
   if (normalized.includes("\r")) return undefined;
   const match = /^@echo off\nsetlocal\nset VSCODE_DEV=\nset ELECTRON_RUN_AS_NODE=1\n"%~dp0\.\.\\Code\.exe" "%~dp0\.\.\\(?:(?<version>[0-9a-f]{10})\\)?resources\\app\\out\\cli\.js" %\*\nIF %ERRORLEVEL% NEQ 0 EXIT \/b %ERRORLEVEL%\nendlocal\n?$/.exec(normalized);
   if (!match) return undefined;
-  const versionDirectory = match.groups?.version;
-  return versionDirectory
-    ? `${versionDirectory}\\resources\\app\\out\\cli.js`
-    : "resources\\app\\out\\cli.js";
+  const versionDirectoryName = match.groups?.version;
+  return {
+    relativeCliPath: versionDirectoryName
+      ? `${versionDirectoryName}\\resources\\app\\out\\cli.js`
+      : "resources\\app\\out\\cli.js",
+    ...(versionDirectoryName ? { versionDirectoryName } : {})
+  };
+}
+
+async function prepareWindowsShadowLauncher(
+  dependencies: VscodeClientRuntimeDependencies,
+  state: AdapterState,
+  layout: WindowsBundledLayout | undefined
+): Promise<PreparedGuiLauncher> {
+  if (dependencies.platform !== "win32" || !layout) return directGuiLauncher(state);
+  await validateWindowsBundledLayout(state.executablePath, layout);
+
+  const shadowRoot = join(state.tempRoot, SHADOW_DIRECTORY);
+  const shadowExecutable = join(shadowRoot, SHADOW_EXECUTABLE);
+  const shadowVersionDirectory = join(shadowRoot, layout.versionDirectoryName);
+  if (shadowRoot !== join(state.tempRoot, SHADOW_DIRECTORY)
+    || shadowExecutable !== join(shadowRoot, SHADOW_EXECUTABLE)
+    || shadowVersionDirectory !== join(shadowRoot, layout.versionDirectoryName)
+    || !isWithin(state.tempRoot, shadowRoot)) {
+    throw new Error("VS Code shadow launcher path escaped isolated client state");
+  }
+
+  const tempInfo = await lstat(state.tempRoot);
+  const canonicalTempRoot = await realpath(state.tempRoot);
+  if (!tempInfo.isDirectory() || tempInfo.isSymbolicLink()
+    || !safeTemporaryRoot(state.tempBase, canonicalTempRoot)
+    || !sameCanonicalPath(state.tempRoot, canonicalTempRoot, dependencies.platform)) {
+    throw new Error("VS Code shadow launcher temporary root was not trusted");
+  }
+  await mkdir(shadowRoot, { mode: 0o700 });
+  const shadowRootInfo = await lstat(shadowRoot);
+  const canonicalShadowRoot = await realpath(shadowRoot);
+  if (!shadowRootInfo.isDirectory() || shadowRootInfo.isSymbolicLink()
+    || !isWithin(canonicalTempRoot, canonicalShadowRoot)
+    || canonicalShadowRoot === canonicalTempRoot) {
+    throw new Error("VS Code shadow launcher root was not trusted");
+  }
+
+  await dependencies.linkFile(layout.executablePath, shadowExecutable);
+  await validateShadowExecutable(dependencies.platform, layout, canonicalShadowRoot, shadowExecutable);
+  await dependencies.createJunction(layout.versionDirectory, shadowVersionDirectory);
+  await validateWindowsBundledLayout(state.executablePath, layout);
+  await validateShadowExecutable(dependencies.platform, layout, canonicalShadowRoot, shadowExecutable);
+
+  const junctionInfo = await lstat(shadowVersionDirectory);
+  if (!junctionInfo.isSymbolicLink()) {
+    throw new Error("VS Code shadow version entry was not a controlled junction");
+  }
+  const junctionTarget = await readlink(shadowVersionDirectory);
+  const resolvedJunctionTarget = isAbsolute(junctionTarget)
+    ? resolve(junctionTarget)
+    : resolve(dirname(shadowVersionDirectory), junctionTarget);
+  const canonicalJunctionTarget = await realpath(shadowVersionDirectory);
+  if (!sameCanonicalPath(resolvedJunctionTarget, layout.versionDirectory, dependencies.platform)
+    || !sameCanonicalPath(canonicalJunctionTarget, layout.versionDirectory, dependencies.platform)) {
+    throw new Error("VS Code shadow version junction did not resolve to the validated active version");
+  }
+  const shadowCliPath = join(
+    shadowVersionDirectory,
+    "resources",
+    "app",
+    "out",
+    "cli.js"
+  );
+  const shadowCliInfo = await lstat(shadowCliPath);
+  const canonicalShadowCli = await realpath(shadowCliPath);
+  if (!shadowCliInfo.isFile() || shadowCliInfo.isSymbolicLink()
+    || shadowCliInfo.size !== layout.cliIdentity.size
+    || !sameFileIdentity(shadowCliInfo, layout.cliIdentity)
+    || !sameCanonicalPath(canonicalShadowCli, layout.cliPath, dependencies.platform)) {
+    throw new Error("VS Code shadow bundled CLI did not resolve to the validated active version");
+  }
+  return {
+    executablePath: shadowExecutable,
+    argsPrefix: [shadowCliPath],
+    environment: { ...state.environment, ELECTRON_RUN_AS_NODE: "1" }
+  };
+}
+
+function directGuiLauncher(state: AdapterState): PreparedGuiLauncher {
+  return {
+    executablePath: state.executablePath,
+    argsPrefix: [],
+    environment: state.environment
+  };
+}
+
+async function validateShadowExecutable(
+  platform: NodeJS.Platform,
+  layout: WindowsBundledLayout,
+  shadowRoot: string,
+  shadowExecutable: string
+): Promise<void> {
+  if (shadowExecutable !== join(shadowRoot, SHADOW_EXECUTABLE)) {
+    throw new Error("VS Code shadow executable path was not fixed");
+  }
+  const sourceInfo = await lstat(layout.executablePath);
+  const shadowExecutableInfo = await lstat(shadowExecutable);
+  const canonicalSourceExecutable = await realpath(layout.executablePath);
+  const canonicalShadowExecutable = await realpath(shadowExecutable);
+  if (!sourceInfo.isFile() || sourceInfo.isSymbolicLink()
+    || !shadowExecutableInfo.isFile() || shadowExecutableInfo.isSymbolicLink()
+    || sourceInfo.size !== layout.executableIdentity.size
+    || sourceInfo.size !== shadowExecutableInfo.size
+    || !sameFileIdentity(sourceInfo, layout.executableIdentity)
+    || !sameFileIdentity(sourceInfo, shadowExecutableInfo)
+    || !sameCanonicalPath(canonicalSourceExecutable, layout.executablePath, platform)
+    || !sameCanonicalPath(canonicalShadowExecutable, shadowExecutable, platform)
+    || !isWithin(shadowRoot, canonicalShadowExecutable)) {
+    throw new Error("VS Code shadow executable did not preserve trusted file identity");
+  }
+}
+
+async function validateWindowsBundledLayout(
+  executablePath: string,
+  layout: WindowsBundledLayout
+): Promise<void> {
+  if (!/^[0-9a-f]{10}$/.test(layout.versionDirectoryName)) {
+    throw new Error("VS Code active version directory name was not trusted");
+  }
+  const installationRoot = dirname(executablePath);
+  if (!sameCanonicalPath(layout.installationRoot, installationRoot, "win32")
+    || !sameCanonicalPath(layout.executablePath, executablePath, "win32")
+    || !sameCanonicalPath(
+      layout.versionDirectory,
+      join(layout.installationRoot, layout.versionDirectoryName),
+      "win32"
+    )) {
+    throw new Error("VS Code bundled layout no longer matched the selected installation");
+  }
+  const rootInfo = await lstat(layout.installationRoot);
+  const canonicalRoot = await realpath(layout.installationRoot);
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()
+    || !sameFileIdentity(rootInfo, layout.installationRootIdentity)
+    || !sameCanonicalPath(canonicalRoot, layout.installationRoot, "win32")) {
+    throw new Error("VS Code installation root was not canonical");
+  }
+  const canonicalExecutable = await validateContainedRegularFile(canonicalRoot, [SHADOW_EXECUTABLE]);
+  const executableInfo = await lstat(canonicalExecutable);
+  if (!sameFileIdentity(executableInfo, layout.executableIdentity)
+    || executableInfo.size !== layout.executableIdentity.size) {
+    throw new Error("VS Code executable changed after bundled layout validation");
+  }
+  const canonicalLauncher = await validateContainedRegularFile(canonicalRoot, ["bin", "code.cmd"]);
+  const launcherInfo = await lstat(canonicalLauncher);
+  if (!sameFileIdentity(launcherInfo, layout.launcherIdentity)
+    || launcherInfo.size !== layout.launcherIdentity.size) {
+    throw new Error("VS Code bundled CLI launcher changed after layout validation");
+  }
+  const launcher = await readBoundedTrustedFile(
+    canonicalLauncher,
+    canonicalRoot,
+    MAX_WINDOWS_LAUNCHER_BYTES
+  );
+  const parsedLauncher = parseWindowsBundledCliLauncher(launcher);
+  if (!parsedLauncher || parsedLauncher.versionDirectoryName !== layout.versionDirectoryName
+    || parsedLauncher.relativeCliPath !== `${layout.versionDirectoryName}\\resources\\app\\out\\cli.js`) {
+    throw new Error("VS Code bundled CLI launcher changed after layout validation");
+  }
+  const canonicalCli = await validateContainedRegularFile(
+    canonicalRoot,
+    parsedLauncher.relativeCliPath.split("\\"),
+    MAX_WINDOWS_BUNDLED_CLI_BYTES
+  );
+  const cliInfo = await lstat(canonicalCli);
+  const canonicalVersionDirectory = await validateContainedDirectory(
+    canonicalRoot,
+    [layout.versionDirectoryName]
+  );
+  const versionDirectoryInfo = await lstat(canonicalVersionDirectory);
+  if (!sameCanonicalPath(canonicalExecutable, layout.executablePath, "win32")
+    || !sameCanonicalPath(canonicalLauncher, layout.launcherPath, "win32")
+    || !sameFileIdentity(cliInfo, layout.cliIdentity)
+    || cliInfo.size !== layout.cliIdentity.size
+    || !sameCanonicalPath(canonicalCli, layout.cliPath, "win32")
+    || !sameFileIdentity(versionDirectoryInfo, layout.versionDirectoryIdentity)
+    || !sameCanonicalPath(canonicalVersionDirectory, layout.versionDirectory, "win32")) {
+    throw new Error("VS Code bundled layout changed after validation");
+  }
+}
+
+async function validateContainedDirectory(root: string, segments: readonly string[]): Promise<string> {
+  if (segments.length === 0 || segments.some((segment) => !segment || segment === "." || segment === ".."
+    || segment.includes("/") || segment.includes("\\") || /[\u0000-\u001f\u007f]/.test(segment))) {
+    throw new Error("VS Code bundled directory path was not trusted");
+  }
+  let candidate = root;
+  for (const segment of segments) {
+    candidate = join(candidate, segment);
+    if (!isWithin(root, candidate)) throw new Error("VS Code bundled directory escaped its installation root");
+    const info = await lstat(candidate);
+    if (!info.isDirectory() || info.isSymbolicLink()) {
+      throw new Error("VS Code bundled directory contained an unsafe filesystem entry");
+    }
+    const canonicalCandidate = await realpath(candidate);
+    if (!isWithin(root, canonicalCandidate)) {
+      throw new Error("VS Code bundled directory escaped its installation root");
+    }
+    candidate = canonicalCandidate;
+  }
+  return candidate;
 }
 
 async function validateContainedRegularFile(
@@ -568,6 +957,137 @@ async function preflightPackageTree(canonicalRoot: string): Promise<void> {
   await visit(canonicalRoot, 0);
 }
 
+async function materializeObserver(
+  tempRoot: string,
+  extensionsDir: string,
+  observerRoot: string
+): Promise<void> {
+  if (observerRoot !== join(extensionsDir, OBSERVER_DIRECTORY) || !isWithin(tempRoot, observerRoot)) {
+    throw new Error("VS Code observer materialization path escaped isolated client state");
+  }
+  const registry = observerRegistry(observerRoot);
+  await mkdir(observerRoot);
+  await writeFile(join(observerRoot, "package.json"), OBSERVER_MANIFEST, { encoding: "utf8", flag: "wx" });
+  await writeFile(join(observerRoot, "extension.js"), OBSERVER_SOURCE, { encoding: "utf8", flag: "wx" });
+  await writeFile(join(extensionsDir, "extensions.json"), registry, { encoding: "utf8", flag: "wx" });
+  await validateObserverMaterialization(tempRoot, extensionsDir, observerRoot, true);
+}
+
+function observerRegistry(observerRoot: string): string {
+  const location = pathToFileURL(observerRoot);
+  return `${JSON.stringify([{
+    identifier: { id: OBSERVER_EXTENSION_ID },
+    version: "1.0.0",
+    location: {
+      $mid: 1,
+      path: decodeURIComponent(location.pathname),
+      scheme: "file"
+    },
+    relativeLocation: OBSERVER_DIRECTORY
+  }], null, 2)}\n`;
+}
+
+async function validateObserverMaterialization(
+  tempRoot: string,
+  extensionsDir: string,
+  observerRoot: string,
+  requireMissingMarker: boolean
+): Promise<void> {
+  if (extensionsDir !== join(tempRoot, "extensions")
+    || observerRoot !== join(extensionsDir, OBSERVER_DIRECTORY)) {
+    throw new Error("VS Code observer path did not match its fixed isolated location");
+  }
+  const tempInfo = await lstat(tempRoot);
+  const extensionsInfo = await lstat(extensionsDir);
+  const observerInfo = await lstat(observerRoot);
+  if (!tempInfo.isDirectory() || tempInfo.isSymbolicLink()
+    || !extensionsInfo.isDirectory() || extensionsInfo.isSymbolicLink()
+    || !observerInfo.isDirectory() || observerInfo.isSymbolicLink()) {
+    throw new Error("VS Code observer path contained an unsafe filesystem entry");
+  }
+  const canonicalTempRoot = await realpath(tempRoot);
+  const canonicalExtensionsDir = await realpath(extensionsDir);
+  const canonicalObserverRoot = await realpath(observerRoot);
+  if (!isWithin(canonicalTempRoot, canonicalExtensionsDir)
+    || !isWithin(canonicalExtensionsDir, canonicalObserverRoot)
+    || canonicalExtensionsDir === canonicalTempRoot
+    || canonicalObserverRoot === canonicalExtensionsDir) {
+    throw new Error("VS Code observer path escaped isolated client state");
+  }
+  const manifestPath = await validateContainedRegularFile(
+    canonicalObserverRoot,
+    ["package.json"],
+    Buffer.byteLength(OBSERVER_MANIFEST)
+  );
+  const sourcePath = await validateContainedRegularFile(
+    canonicalObserverRoot,
+    ["extension.js"],
+    Buffer.byteLength(OBSERVER_SOURCE)
+  );
+  const manifest = await readBoundedTrustedFile(
+    manifestPath,
+    canonicalObserverRoot,
+    Buffer.byteLength(OBSERVER_MANIFEST)
+  );
+  const source = await readBoundedTrustedFile(
+    sourcePath,
+    canonicalObserverRoot,
+    Buffer.byteLength(OBSERVER_SOURCE)
+  );
+  if (manifest !== OBSERVER_MANIFEST || source !== OBSERVER_SOURCE) {
+    throw new Error("VS Code observer materialization content did not match its trusted definition");
+  }
+  if (requireMissingMarker) {
+    const expectedRegistry = observerRegistry(canonicalObserverRoot);
+    const registryPath = await validateContainedRegularFile(
+      canonicalExtensionsDir,
+      ["extensions.json"],
+      Buffer.byteLength(expectedRegistry)
+    );
+    const registry = await readBoundedTrustedFile(
+      registryPath,
+      canonicalExtensionsDir,
+      Buffer.byteLength(expectedRegistry)
+    );
+    if (registry !== expectedRegistry) {
+      throw new Error("VS Code observer registration content did not match its trusted definition");
+    }
+    const markerInfo = await lstatIfPresent(join(canonicalObserverRoot, OBSERVER_MARKER_FILENAME));
+    if (markerInfo) throw new Error("VS Code observer marker existed before the client observation session");
+  }
+}
+
+async function validateObserverMarker(tempRoot: string, observerRoot: string, markerPath: string): Promise<boolean> {
+  const markerInfo = await lstatIfPresent(markerPath);
+  if (!markerInfo) return false;
+  if (markerPath !== join(observerRoot, OBSERVER_MARKER_FILENAME) || !isWithin(tempRoot, markerPath)
+    || !markerInfo.isFile() || markerInfo.isSymbolicLink()
+    || markerInfo.size !== Buffer.byteLength(OBSERVER_MARKER_CONTENT)) {
+    throw new Error("VS Code observer marker was outside trusted bounds");
+  }
+  await validateObserverMaterialization(
+    tempRoot,
+    join(tempRoot, "extensions"),
+    observerRoot,
+    false
+  );
+  const canonicalObserverRoot = await realpath(observerRoot);
+  const canonicalMarkerPath = await validateContainedRegularFile(
+    canonicalObserverRoot,
+    [OBSERVER_MARKER_FILENAME],
+    Buffer.byteLength(OBSERVER_MARKER_CONTENT)
+  );
+  const marker = await readBoundedTrustedFile(
+    canonicalMarkerPath,
+    canonicalObserverRoot,
+    Buffer.byteLength(OBSERVER_MARKER_CONTENT)
+  );
+  if (marker !== OBSERVER_MARKER_CONTENT) {
+    throw new Error("VS Code observer marker content was not trusted");
+  }
+  return true;
+}
+
 function isolatedEnvironment(source: NodeJS.ProcessEnv, tempRoot: string, homeDir: string): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {};
   for (const key of [
@@ -711,6 +1231,7 @@ async function terminateProcess(dependencies: VscodeClientRuntimeDependencies, l
     await Promise.race([launched.exit, delay(250)]);
     if (!launched.exited) throw new Error("VS Code process-tree cleanup did not complete within bounds");
     if (trustedCleanupFailed) throw new Error("VS Code trusted process-tree cleanup failed");
+    await delay(TERMINATION_SETTLE_MS);
     return;
   }
   if (pid !== undefined && launched.groupSafe) {
@@ -762,13 +1283,29 @@ function qualifyingLoadRecords(raw: string, packageRoot: string): number {
   let matches = 0;
   for (const rawLine of raw.split(/\r?\n/).slice(0, 4_096)) {
     const line = rawLine.slice(0, 8_192).toLowerCase().replaceAll("\\", "/");
-    if (!rootForms.some((root) => line.includes(root))) continue;
-    if (!/\b(?:discover(?:ed|ing|s|y)?|load(?:ed|ing|s)?|read(?:ing|s)?|watch(?:ed|er|ers|es|ing)?)\b/i.test(line)) continue;
-    if (!/(agent\s*plugin|chat\s*plugin|plugin\.json|skill\.md)/i.test(line)) continue;
+    if (!/\[file watcher \((?:universal|node\.js|parcel|'node\.js'|'parcel'|chokidar|nsfw)\)\]/.test(line)) continue;
+    if (!/(?:request to start watching:|started watching:|starting fs\.watchfile\(\) on|reusing an existing recursive watcher for)/.test(line)) continue;
+    if (!rootForms.some((root) => containsBoundedPathReference(line, root))) continue;
     matches += 1;
     if (matches === 64) break;
   }
   return matches;
+}
+
+function containsBoundedPathReference(line: string, path: string): boolean {
+  let offset = 0;
+  while (offset <= line.length - path.length) {
+    const index = line.indexOf(path, offset);
+    if (index < 0) return false;
+    const before = index === 0 ? "" : line[index - 1]!;
+    const afterIndex = index + path.length;
+    const after = afterIndex === line.length ? "" : line[afterIndex]!;
+    const boundedBefore = before === "" || /[\s'"([{:]/.test(before);
+    const boundedAfter = after === "" || /[\/\s'"),\]}:]/.test(after);
+    if (boundedBefore && boundedAfter) return true;
+    offset = index + 1;
+  }
+  return false;
 }
 
 async function collectVscodeLogs(userDataDir: string): Promise<string> {
@@ -830,10 +1367,25 @@ async function collectVscodeLogs(userDataDir: string): Promise<string> {
           || !sameFileIdentity(info, openedInfo) || !sameFileIdentity(postOpenInfo, openedInfo)) continue;
         const maximum = Math.min(MAX_LOG_FILE_BYTES, MAX_LOG_BYTES - retainedBytes, openedInfo.size);
         if (maximum <= 0) continue;
-        const buffer = Buffer.alloc(maximum);
-        const { bytesRead } = await handle.read(buffer, 0, maximum, 0);
-        chunks.push(buffer.subarray(0, bytesRead));
-        retainedBytes += bytesRead;
+        const truncated = openedInfo.size > maximum;
+        const separatorLength = truncated ? 1 : 0;
+        const payloadMaximum = maximum - separatorLength;
+        const firstLength = truncated ? Math.floor(payloadMaximum / 2) : payloadMaximum;
+        const first = Buffer.alloc(firstLength);
+        const firstRead = await handle.read(first, 0, firstLength, 0);
+        chunks.push(first.subarray(0, firstRead.bytesRead));
+        retainedBytes += firstRead.bytesRead;
+        if (truncated) {
+          chunks.push(Buffer.from("\n"));
+          retainedBytes += 1;
+        }
+        const lastLength = payloadMaximum - firstRead.bytesRead;
+        if (lastLength > 0) {
+          const last = Buffer.alloc(lastLength);
+          const lastRead = await handle.read(last, 0, lastLength, openedInfo.size - lastLength);
+          chunks.push(last.subarray(0, lastRead.bytesRead));
+          retainedBytes += lastRead.bytesRead;
+        }
       } finally {
         await handle.close();
       }
@@ -844,19 +1396,46 @@ async function collectVscodeLogs(userDataDir: string): Promise<string> {
   return Buffer.concat(chunks, retainedBytes).toString("utf8");
 }
 
-function sameFileIdentity(left: { dev: number; ino: number }, right: { dev: number; ino: number }): boolean {
+function sameFileIdentity(left: FileIdentity, right: FileIdentity): boolean {
   return left.dev === right.dev && left.ino === right.ino;
+}
+
+function fileIdentity(value: FileIdentity): FileIdentity {
+  return { dev: value.dev, ino: value.ino };
+}
+
+function fileIdentityWithSize(value: FileIdentity & { size: number }): FileIdentity & { size: number } {
+  return { ...fileIdentity(value), size: value.size };
+}
+
+function sameCanonicalPath(left: string, right: string, platform: NodeJS.Platform): boolean {
+  const normalizedLeft = resolve(left);
+  const normalizedRight = resolve(right);
+  return platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
+async function lstatIfPresent(path: string) {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    const code = error instanceof Error && "code" in error ? error.code : undefined;
+    if (code === "ENOENT" || code === "ENOTDIR") return undefined;
+    throw error;
+  }
 }
 
 function loadOnlyOutput(
   status: ClientRuntimeAdapterOutput["status"],
   clientLoad: ClientRuntimeAdapterOutput["clientLoad"],
   targetClientVersion: string | undefined,
-  evidenceItems: ClientRuntimeAdapterOutput["evidence"]
+  evidenceItems: ClientRuntimeAdapterOutput["evidence"],
+  complete = true
 ): ClientRuntimeAdapterOutput {
   return {
     status,
-    complete: true,
+    complete,
     packageInstall: "not-observed",
     clientLoad,
     mcpStartup: "not-assessed",
