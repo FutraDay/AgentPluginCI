@@ -2,11 +2,11 @@
 
 Agent Plugin CI builds and validates portable Agent Plugins from real integration sources.
 
-> **v0.1 Developer Preview** — MCP ingestion, OpenAPI ingestion, deterministic `PluginIR` normalization, Agent Plugins 1.0 compilation, validation, and a distribution-ready CLI.
+> **v0.1 Developer Preview** — MCP ingestion, OpenAPI ingestion, deterministic `PluginIR` normalization, Agent Plugins 1.0 compilation, validation, security scanning, static compatibility testing, and a distribution-ready CLI.
 
 The core architecture is intentionally fixed:
 
-`Source -> PluginIR -> Compiler -> Validator -> Security Scan -> Package`
+`Source -> PluginIR -> Compiler -> Official Validation -> Security Scan -> Compatibility Testing -> Package`
 
 No source ingestion path compiles directly into `plugin.json`.
 
@@ -20,11 +20,12 @@ No source ingestion path compiles directly into `plugin.json`.
 - `plugin.json`, optional `mcp.json`, and `skills/*/SKILL.md` output
 - package validation from the CLI
 - deterministic package security scanning with stable findings and CI severity policy
+- versioned static compatibility profiles for Agent Plugins 1.0 portable core, Cursor, and VS Code/GitHub Copilot
 - machine-readable JSON results for CI
 - bundled npm CLI package
 - GitHub CI and tagged release packaging
 
-Markdown/docs/repository ingestion, compatibility matrices, certification, hosted builds, and the web application are intentionally deferred until after v0.1.
+Markdown/docs/repository ingestion, runtime client adapters, compatibility matrices backed by runtime evidence, certification, hosted builds, and the web application are intentionally deferred until after v0.1.
 
 ## Quick start
 
@@ -51,7 +52,7 @@ agentplugin --version
 
 The installed executable name is `agentplugin`.
 
-The published npm `0.1.0` package predates Phase 2I security scanning. The `scan` command documented below is currently available from the repository build and will ship with a subsequent published CLI release.
+The published npm `0.1.0` package predates Phase 2I security scanning and Phase 2J compatibility testing. The `scan` and `compat` commands documented below are currently available from the repository build and will ship with a subsequent published CLI release.
 
 ## Build from MCP
 
@@ -102,14 +103,27 @@ node apps/cli/dist/index.cjs scan dist/support-api --fail-on none --json
 
 The default policy fails on `high` or `critical` findings. `--fail-on none` keeps the scan report-only. Findings include stable IDs, severity, location, redacted evidence, and remediation guidance. Builds also run an in-memory report-only scan so new security findings are surfaced without changing existing build success semantics.
 
+## Check static compatibility
+
+Compatibility testing consumes a compiled Agent Plugins package; it does not ingest arbitrary sources, execute plugin code, install the package into a client, or launch MCP servers.
+
+```powershell
+node apps/cli/dist/index.cjs compat dist/support-api
+node apps/cli/dist/index.cjs compat dist/support-api --profile cursor-agent-plugins-1.0
+node apps/cli/dist/index.cjs compat dist/support-api --all --json
+```
+
+The default profile is `agent-plugins-1.0-portable-core`. Built-in client profiles are evidence-backed by first-party documentation for Cursor and VS Code/GitHub Copilot. Reports contain versioned profile and test IDs, bounded evidence, deterministic summaries, completeness, an explicit `static-inspection` evidence level, and `runtimeVerified: false`. Passing means statically eligible under the selected profile; client installation and MCP handshake evidence remain `not-assessed`, so the report never claims proven runtime interoperability. This phase confirms bounded, regular `skills/*/SKILL.md` discovery paths but does not validate `SKILL.md` document semantics, which is reported as a warning rather than silently treated as proven. Builds surface the portable-core result in report-only mode without changing successful build exit semantics.
+
 ## Machine-readable CI output
 
-Add `--json` to `build`, `validate`, or `scan` to emit one JSON object on stdout.
+Add `--json` to `build`, `validate`, `scan`, or `compat` to emit one JSON object on stdout.
 
 ```powershell
 node apps/cli/dist/index.cjs build --openapi fixtures/openapi/search.json --name search-api --out dist/search-api --json
 node apps/cli/dist/index.cjs validate dist/search-api --json
 node apps/cli/dist/index.cjs scan dist/search-api --json
+node apps/cli/dist/index.cjs compat dist/search-api --all --json
 ```
 
 ## Output structure

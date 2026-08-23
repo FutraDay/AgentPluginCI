@@ -23,6 +23,9 @@ importers:
 
   apps/cli:
     devDependencies:
+      '@agent-plugin-ci/compatibility':
+        specifier: workspace:*
+        version: link:../../packages/compatibility
       '@agent-plugin-ci/compiler':
         specifier: workspace:*
         version: link:../../packages/compiler
@@ -44,6 +47,15 @@ importers:
       esbuild:
         specifier: ^0.28.2
         version: 0.28.2
+
+  packages/compatibility:
+    dependencies:
+      '@agent-plugin-ci/spec-agent-plugins-v1':
+        specifier: workspace:*
+        version: link:../spec-agent-plugins-v1
+      '@agent-plugin-ci/validator':
+        specifier: workspace:*
+        version: link:../validator
 
   packages/compiler:
     dependencies:

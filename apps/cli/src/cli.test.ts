@@ -25,6 +25,10 @@ describe("Agent Plugin CI CLI", () => {
     expect(buildResult.security.mode).toBe("report-only");
     expect(buildResult.security.complete).toBe(true);
     expect(buildResult.security.summary.total).toBe(0);
+    expect(buildResult.compatibility.mode).toBe("report-only");
+    expect(buildResult.compatibility.staticEligibility).toBe("eligible");
+    expect(buildResult.compatibility.runtimeEvidence.clientInstall).toBe("not-assessed");
+    expect(buildResult.compatibility.runtimeEvidence.runtimeVerified).toBe(false);
     expect(JSON.parse(await readFile(join(out, "plugin.json"), "utf8")).name).toBeTruthy();
     const validation = capture();
     expect(await runCli(["validate", out, "--json"], { cwd, ...validation.io })).toBe(0);
@@ -229,6 +233,107 @@ describe("Agent Plugin CI CLI", () => {
     const code = await runCli(["scan", ".", "--fail-on", "severe", "--json"], cap.io);
     expect(code).toBe(2);
     expect(JSON.parse(cap.stdout[0]!).error.code).toBe("USAGE_ERROR");
+  });
+
+  it("reports text and deterministic JSON static compatibility evidence", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-compat-cli-"));
+    const out = join(cwd, "out");
+    expect(await runCli(["build", "--ir", join(repoRoot, "fixtures/hello/plugin-ir.json"), "--out", out], { cwd, ...capture().io })).toBe(0);
+
+    const textResult = capture();
+    expect(await runCli(["compat", out], { cwd, ...textResult.io })).toBe(0);
+    expect(textResult.stdout).toContain(`PROFILE agent-plugins-1.0-portable-core@1.0.0 status=warn static-eligibility=eligible`);
+    expect(textResult.stdout).toContain("RUNTIME_EVIDENCE verified=false client-install=not-assessed mcp-handshake=not-assessed");
+
+    const first = capture();
+    const second = capture();
+    expect(await runCli(["compat", join(out, "plugin.json"), "--json"], { cwd, ...first.io })).toBe(0);
+    expect(await runCli(["compat", join(out, "plugin.json"), "--json"], { cwd, ...second.io })).toBe(0);
+    expect(first.stdout[0]).toBe(second.stdout[0]);
+    const payload = JSON.parse(first.stdout[0]!);
+    expect(payload.ok).toBe(true);
+    expect(payload.evidenceLevel).toBe("static-inspection");
+    expect(payload.runtimeEvidence.runtimeVerified).toBe(false);
+    expect(payload.runtimeEvidence.mcpHandshake).toBe("not-assessed");
+  });
+
+  it("selects one compatibility profile or all built-in profiles", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-compat-profiles-"));
+    const out = join(cwd, "out");
+    expect(await runCli(["build", "--openapi", join(repoRoot, "fixtures/openapi/search.json"), "--out", out], { cwd, ...capture().io })).toBe(0);
+
+    const selected = capture();
+    expect(await runCli(["compat", out, "--profile", "cursor-agent-plugins-1.0", "--json"], { cwd, ...selected.io })).toBe(0);
+    expect(JSON.parse(selected.stdout[0]!).profiles.map((profile: { profile: { id: string } }) => profile.profile.id)).toEqual(["cursor-agent-plugins-1.0"]);
+
+    const all = capture();
+    expect(await runCli(["compat", out, "--all", "--json"], { cwd, ...all.io })).toBe(0);
+    expect(JSON.parse(all.stdout[0]!).profiles.map((profile: { profile: { id: string } }) => profile.profile.id)).toEqual([
+      "agent-plugins-1.0-portable-core",
+      "cursor-agent-plugins-1.0",
+      "vscode-github-copilot-agent-plugins-1.0"
+    ]);
+  });
+
+  it("uses exit code 2 for invalid compatibility invocation and unknown profiles", async () => {
+    const unknown = capture();
+    expect(await runCli(["compat", ".", "--profile", "unknown", "--json"], unknown.io)).toBe(2);
+    expect(JSON.parse(unknown.stdout[0]!).error.code).toBe("USAGE_ERROR");
+
+    const conflicting = capture();
+    expect(await runCli(["compat", ".", "--all", "--profile", "cursor-agent-plugins-1.0", "--json"], conflicting.io)).toBe(2);
+    expect(JSON.parse(conflicting.stdout[0]!).exitCode).toBe(2);
+
+    const missingProfile = capture();
+    expect(await runCli(["compat", ".", "--profile", "--json"], missingProfile.io)).toBe(2);
+    expect(JSON.parse(missingProfile.stdout[0]!).error.code).toBe("USAGE_ERROR");
+  });
+
+  it("uses exit code 1 for an invalid compatibility package", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-compat-invalid-"));
+    await writeFile(join(cwd, "plugin.json"), "{invalid", "utf8");
+    const cap = capture();
+    expect(await runCli(["compat", cwd, "--json"], { cwd, ...cap.io })).toBe(1);
+    const payload = JSON.parse(cap.stdout[0]!);
+    expect(payload.ok).toBe(false);
+    expect(payload.staticEligibility).toBe("ineligible");
+    expect(cap.stdout[0]).not.toContain("Unexpected token");
+  });
+
+  it("uses exit code 1 for incomplete compatibility inspection", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-compat-incomplete-"));
+    await writeFile(join(cwd, "plugin.json"), "x".repeat(1_000_001), "utf8");
+    const cap = capture();
+    expect(await runCli(["compat", cwd, "--json"], { cwd, ...cap.io })).toBe(1);
+    expect(JSON.parse(cap.stdout[0]!)).toMatchObject({
+      ok: false,
+      complete: false,
+      status: "unknown",
+      staticEligibility: "unknown"
+    });
+  });
+
+  it("escapes control characters in compatibility input errors", async () => {
+    const cap = capture();
+    expect(await runCli(["compat", "missing\nINJECTED"], cap.io)).toBe(1);
+    expect(cap.stderr.some((message) => message.includes("\\u000aINJECTED"))).toBe(true);
+    expect(cap.stderr.every((message) => !message.includes("\n"))).toBe(true);
+  });
+
+  it("runs MCP, OpenAPI, and PluginIR through validate, scan, and compatibility", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-compat-e2e-"));
+    const builds = [
+      ["build", "--mcp", join(repoRoot, "fixtures/mcp/stdio.json"), "--no-discover", "--name", "e2e-mcp"],
+      ["build", "--openapi", join(repoRoot, "fixtures/openapi/support.yaml"), "--name", "e2e-openapi"],
+      ["build", "--ir", join(repoRoot, "fixtures/hello/plugin-ir.json")]
+    ];
+    for (const [index, buildArgs] of builds.entries()) {
+      const out = join(cwd, `out-${index}`);
+      expect(await runCli([...buildArgs, "--out", out], { cwd, ...capture().io })).toBe(0);
+      expect(await runCli(["validate", out], { cwd, ...capture().io })).toBe(0);
+      expect(await runCli(["scan", out], { cwd, ...capture().io })).toBe(0);
+      expect(await runCli(["compat", out, "--all"], { cwd, ...capture().io })).toBe(0);
+    }
   });
 
 });

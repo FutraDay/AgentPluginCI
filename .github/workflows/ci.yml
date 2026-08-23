@@ -34,6 +34,14 @@ jobs:
           node apps/cli/dist/index.cjs validate dist/ci-openapi
           node apps/cli/dist/index.cjs validate dist/ci-mcp
           node apps/cli/dist/index.cjs validate dist/ci-ir
+      - name: Security and compatibility smoke packages
+        run: |
+          node apps/cli/dist/index.cjs scan dist/ci-openapi
+          node apps/cli/dist/index.cjs scan dist/ci-mcp
+          node apps/cli/dist/index.cjs scan dist/ci-ir
+          node apps/cli/dist/index.cjs compat dist/ci-openapi --all
+          node apps/cli/dist/index.cjs compat dist/ci-mcp --all
+          node apps/cli/dist/index.cjs compat dist/ci-ir --all
       - name: Pack CLI
         run: pnpm pack:cli
       - name: Installed package smoke
@@ -45,6 +53,8 @@ jobs:
           ./node_modules/.bin/agentplugin --version
           ./node_modules/.bin/agentplugin build --openapi "$GITHUB_WORKSPACE/fixtures/openapi/search.json" --name packaged-smoke --out out --json
           ./node_modules/.bin/agentplugin validate out --json
+          ./node_modules/.bin/agentplugin scan out --json
+          ./node_modules/.bin/agentplugin compat out --all --json
       - run: git diff --check
       - uses: actions/upload-artifact@v4
         with:

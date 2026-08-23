@@ -1,5 +1,13 @@
 import { lstat, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import {
+  assessPackageCompatibility,
+  assessPluginCompatibility,
+  BUILT_IN_COMPATIBILITY_PROFILES,
+  PORTABLE_CORE_PROFILE_ID,
+  UnknownCompatibilityProfileError,
+  type CompatibilitySuiteReport
+} from "@agent-plugin-ci/compatibility";
 import { compilePlugin, type CompiledPlugin } from "@agent-plugin-ci/compiler";
 import { createSdkMcpToolDiscoverer, ingestMcpConfig, mcpConfigFromUrl } from "@agent-plugin-ci/ingest-mcp";
 import { ingestOpenApiSource } from "@agent-plugin-ci/ingest-openapi";
@@ -66,6 +74,7 @@ export async function runCli(rawArgs: string[], io: CliIo = {}): Promise<number>
     if (args[0] === "build") return await runBuild(args.slice(1), cwd, stdout, stderr);
     if (args[0] === "validate") return await runValidate(args.slice(1), cwd, stdout, stderr);
     if (args[0] === "scan") return await runScan(args.slice(1), cwd, stdout, stderr);
+    if (args[0] === "compat") return await runCompat(args.slice(1), cwd, stdout, stderr);
     throw new CliError(`Unknown command: ${args[0]}`, "USAGE_ERROR", 2);
   } catch (error) {
     return renderFailure(error, json, stdout, stderr);
@@ -124,6 +133,11 @@ async function runBuild(
     mcp: compiled.mcp,
     skills: compiled.skills
   });
+  const compatibility = assessPluginCompatibility({
+    manifest: compiled.manifest,
+    mcp: compiled.mcp,
+    skills: Object.keys(compiled.skills).map((name) => ({ name, location: `skills/${name}/SKILL.md` }))
+  });
 
   const outDir = resolve(cwd, options.out ?? join("dist", ir.identity.name));
   await writeCompiledPackage(compiled, outDir, cwd, options.force);
@@ -140,6 +154,7 @@ async function runBuild(
       capabilities: ir.capabilities?.length ?? 0
     },
     security: { mode: "report-only" as const, ...security },
+    compatibility: { mode: "report-only" as const, ...compatibility },
     warnings: [...warnings, ...validation.warnings.map((message) => ({ code: "VALIDATION_WARNING", message }))]
   };
 
@@ -219,6 +234,29 @@ async function runScan(
 
   if (json) stdout(JSON.stringify(payload));
   else renderSecurityScan(payload, stdout, stderr);
+  return ok ? 0 : 1;
+}
+
+async function runCompat(
+  args: string[],
+  cwd: string,
+  stdout: (message: string) => void,
+  stderr: (message: string) => void
+): Promise<number> {
+  const { target, json, profileIds } = parseCompatArgs(args);
+  const resolved = resolve(cwd, target);
+  const info = await stat(resolved).catch(() => undefined);
+  if (!info) throw new CliError(`Compatibility target not found: ${target}`, "COMPATIBILITY_INPUT_ERROR");
+  if (!info.isDirectory() && basename(resolved) !== "plugin.json") {
+    throw new CliError("Compatibility target must be a package directory or its plugin.json file", "COMPATIBILITY_INPUT_ERROR");
+  }
+  const packageDir = info.isDirectory() ? resolved : dirname(resolved);
+  const report = await assessPackageCompatibility(packageDir, profileIds);
+  const ok = report.staticEligibility === "eligible";
+  const payload = { ok, command: "compat", version: CLI_VERSION, target: packageDir, ...report };
+
+  if (json) stdout(JSON.stringify(payload));
+  else renderCompatibility(payload, stdout, stderr);
   return ok ? 0 : 1;
 }
 
@@ -312,6 +350,48 @@ function parseScanArgs(args: string[]): { target: string; json: boolean; failOn:
   return { target, json, failOn };
 }
 
+function parseCompatArgs(args: string[]): { target: string; json: boolean; profileIds: string[] } {
+  let target = ".";
+  let seenTarget = false;
+  let json = false;
+  let profile: string | undefined;
+  let all = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (arg === "--json") {
+      json = true;
+      continue;
+    }
+    if (arg === "--all") {
+      if (all) throw new CliError("--all may only be provided once", "USAGE_ERROR", 2);
+      all = true;
+      continue;
+    }
+    if (arg === "--profile") {
+      if (profile) throw new CliError("--profile may only be provided once", "USAGE_ERROR", 2);
+      const value = args[++index];
+      if (!value || value.startsWith("--")) throw new CliError("--profile requires a profile ID", "USAGE_ERROR", 2);
+      profile = value;
+      continue;
+    }
+    if (arg.startsWith("--")) throw new CliError(`Unknown compat option: ${arg}`, "USAGE_ERROR", 2);
+    if (seenTarget) throw new CliError("compat accepts only one target", "USAGE_ERROR", 2);
+    target = arg;
+    seenTarget = true;
+  }
+  if (all && profile) throw new CliError("--profile and --all cannot be used together", "USAGE_ERROR", 2);
+  const profileIds = all
+    ? BUILT_IN_COMPATIBILITY_PROFILES.map((candidate) => candidate.id)
+    : [profile ?? PORTABLE_CORE_PROFILE_ID];
+  for (const profileId of profileIds) {
+    if (!BUILT_IN_COMPATIBILITY_PROFILES.some((candidate) => candidate.id === profileId)) {
+      const error = new UnknownCompatibilityProfileError(profileId);
+      throw new CliError(`${error.message}. Available profiles: ${BUILT_IN_COMPATIBILITY_PROFILES.map((candidate) => candidate.id).join(", ")}`, "USAGE_ERROR", 2);
+    }
+  }
+  return { target, json, profileIds };
+}
+
 function validateSourceSpecificFlags(sourceKind: SourceKind, flags: Set<string>): void {
   const mcpOnly = ["--no-discover", "--allow-stdio-discovery"];
   const openApiOnly = ["--allow-cross-origin-refs", "--allow-external-file-refs"];
@@ -329,7 +409,7 @@ function validateSourceSpecificFlags(sourceKind: SourceKind, flags: Set<string>)
 }
 
 function normalizeLegacyArgs(args: string[]): string[] {
-  if (["build", "validate", "scan"].includes(args[0]!)) return args;
+  if (["build", "validate", "scan", "compat"].includes(args[0]!)) return args;
   if (args[0]?.startsWith("--")) return ["build", ...args];
   if (args[0]) {
     const [input, maybeOut, ...rest] = args;
@@ -503,6 +583,7 @@ function renderBuildSuccess(
     plugin: string;
     counts: { skills: number; mcpServers: number; capabilities: number };
     security: SecurityScanResult & { mode: "report-only" };
+    compatibility: CompatibilitySuiteReport & { mode: "report-only" };
     warnings: Warning[];
   },
   stdout: (message: string) => void,
@@ -523,6 +604,7 @@ function renderBuildSuccess(
       stderr(`SECURITY ${finding.severity.toUpperCase()} ${finding.id} [${sanitizeConsoleText(finding.location)}]: ${sanitizeConsoleText(finding.title)}`);
     }
   }
+  stdout(`COMPATIBILITY_STATIC_${payload.compatibility.staticEligibility.toUpperCase()} ${PORTABLE_CORE_PROFILE_ID} REPORT_ONLY`);
 }
 
 function renderSecurityScan(
@@ -551,6 +633,29 @@ function renderSecurityScan(
   }
 }
 
+function renderCompatibility(
+  payload: CompatibilitySuiteReport & { ok: boolean; target: string },
+  stdout: (message: string) => void,
+  stderr: (message: string) => void
+): void {
+  const write = payload.ok ? stdout : stderr;
+  write(`COMPATIBILITY_STATIC_${payload.staticEligibility.toUpperCase()} ${sanitizeConsoleText(payload.target)}`);
+  write(`COMPATIBILITY_EVIDENCE_LEVEL ${payload.evidenceLevel}`);
+  write(`COMPATIBILITY_COMPLETE ${payload.complete}`);
+  for (const profile of payload.profiles) {
+    write(`PROFILE ${profile.profile.id}@${profile.profile.version} status=${profile.status} static-eligibility=${profile.staticEligibility}`);
+    write(`SUMMARY pass=${profile.summary.pass} warn=${profile.summary.warn} fail=${profile.summary.fail} unknown=${profile.summary.unknown}`);
+    for (const test of profile.tests) {
+      write(`[${test.status.toUpperCase()}] ${test.id}: ${sanitizeConsoleText(test.title)}`);
+      for (const evidence of test.evidence) {
+        write(`  Evidence ${sanitizeConsoleText(evidence.location)}: ${sanitizeConsoleText(evidence.summary)}`);
+      }
+    }
+  }
+  write("RUNTIME_EVIDENCE verified=false client-install=not-assessed mcp-handshake=not-assessed");
+  write(`NOTE ${sanitizeConsoleText(payload.runtimeEvidence.note)}`);
+}
+
 function renderFailure(
   error: unknown,
   json: boolean,
@@ -569,7 +674,7 @@ function renderFailure(
       exitCode: cliError.exitCode
     }));
   } else {
-    stderr(`ERROR ${cliError.code}: ${message}`);
+    stderr(`ERROR ${cliError.code}: ${sanitizeConsoleText(message)}`);
     if (cliError.exitCode === 2) stderr("Run agentplugin --help for usage.");
   }
   return cliError.exitCode;
@@ -608,6 +713,7 @@ Usage:
   agentplugin build --ir <plugin-ir.json> [options]
   agentplugin validate [package-dir|plugin.json] [--json]
   agentplugin scan [package-dir|plugin.json] [--fail-on <severity>] [--json]
+  agentplugin compat [package-dir|plugin.json] [--profile <id>|--all] [--json]
   agentplugin --version
 
 Build options:
@@ -633,9 +739,14 @@ Security scan options:
   --fail-on none                  Report findings without a non-zero policy exit
   --json                          Emit findings, evidence, remediation, and summary as JSON
 
+Compatibility options:
+  --profile <id>                  Run one versioned profile (default: ${PORTABLE_CORE_PROFILE_ID})
+  --all                           Run every built-in static compatibility profile
+  --json                          Emit deterministic static evidence and summaries as JSON
+
 Exit codes:
   0  Success
-  1  Build, input, security, or validation failure
+  1  Build, input, security, validation, or compatibility failure
   2  Invalid CLI usage
 
 Security defaults are deny-by-default for stdio execution, private-network access,
