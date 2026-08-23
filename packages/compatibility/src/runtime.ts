@@ -1,8 +1,8 @@
 import type { Stats } from "node:fs";
 import { lookup } from "node:dns/promises";
-import { lstat, readFile } from "node:fs/promises";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import { isIP } from "node:net";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Client, SSEClientTransport, StreamableHTTPClientTransport, type FetchLike, type Transport } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { validateCompiledPlugin } from "@agent-plugin-ci/validator";
@@ -75,10 +75,145 @@ export interface RuntimeCompatibilityOptions {
   timeoutMs?: number;
 }
 
+export interface ClientMcpStdioTarget {
+  name: string;
+  location: string;
+}
+
+export type ClientMcpStdioPreflight =
+  | { ok: true; target: ClientMcpStdioTarget }
+  | { ok: false; code: string; location: string; summary: string };
+
 type RuntimeOptions = Required<RuntimeCompatibilityOptions>;
 type ReadJsonResult = { present: boolean; value?: Record<string, unknown>; issue?: RuntimeCompatibilityEvidence };
 
 class RuntimeTimeoutError extends Error {}
+
+/**
+ * Performs the non-executing subset of the Phase 3A stdio safety checks for a
+ * client-mediated runtime. Client adapters use this before granting a real
+ * client access to package runtime metadata. The deliberately narrow contract
+ * accepts one environment-free stdio target so attribution stays exact and no
+ * secret-bearing environment is passed to the client.
+ */
+export async function preflightSingleClientMcpStdioTarget(
+  packageDir: string
+): Promise<ClientMcpStdioPreflight> {
+  const root = resolve(packageDir);
+  const rootInfo = await readStats(root);
+  if (!rootInfo.info || !rootInfo.info.isDirectory() || rootInfo.info.isSymbolicLink()) {
+    return clientPreflightFailure(
+      "APCI-RUNTIME-INPUT-001",
+      "package",
+      "Package root must be a readable regular directory and not a symbolic link."
+    );
+  }
+
+  const pluginRead = await readJsonObject(join(root, "plugin.json"), "plugin.json", true);
+  const mcpRead = await readJsonObject(join(root, "mcp.json"), "mcp.json", true);
+  if (pluginRead.issue || !pluginRead.value) {
+    return clientPreflightFailure(
+      pluginRead.issue?.code ?? "APCI-RUNTIME-INPUT-002",
+      pluginRead.issue?.location ?? "plugin.json",
+      "Required plugin.json could not be assessed safely."
+    );
+  }
+  if (mcpRead.issue || !mcpRead.value) {
+    return clientPreflightFailure(
+      mcpRead.issue?.code ?? "APCI-RUNTIME-INPUT-010",
+      mcpRead.issue?.location ?? "mcp.json",
+      "Required mcp.json could not be assessed safely."
+    );
+  }
+
+  const validation = validateCompiledPlugin(pluginRead.value, mcpRead.value);
+  if (!validation.ok) {
+    return clientPreflightFailure(
+      "APCI-RUNTIME-INPUT-003",
+      validation.errors[0] ? validationLocation(validation.errors[0]) : "package",
+      "Official Agent Plugins validation failed; client-mediated runtime execution was not permitted."
+    );
+  }
+
+  const rawServers = isRecord(mcpRead.value.mcpServers)
+    ? Object.entries(mcpRead.value.mcpServers)
+    : [];
+  if (rawServers.length !== 1) {
+    return clientPreflightFailure(
+      "APCI-RUNTIME-CLIENT-001",
+      "mcp.json/mcpServers",
+      "Client-mediated MCP execution requires exactly one server so runtime evidence remains attributable."
+    );
+  }
+
+  const [rawName, raw] = rawServers[0]!;
+  const location = `mcp.json/mcpServers/${safeText(rawName)}`;
+  if (rawName.length === 0 || rawName.length > 128 || safeText(rawName) !== rawName || !isRecord(raw)) {
+    return clientPreflightFailure(
+      "APCI-RUNTIME-BOUND-002",
+      location,
+      "MCP server metadata is outside runtime processing bounds."
+    );
+  }
+  if (raw.type !== "stdio") {
+    return clientPreflightFailure(
+      "APCI-RUNTIME-CLIENT-002",
+      location,
+      "Client-mediated MCP execution currently permits only one bounded stdio server."
+    );
+  }
+
+  const command = boundedString(raw.command, MAX_COMMAND);
+  const args = boundedStringArray(raw.args, MAX_ARGS, MAX_STRING);
+  if (!command || args === undefined || raw.cwd !== undefined) {
+    return clientPreflightFailure(
+      "APCI-RUNTIME-BOUND-003",
+      location,
+      "stdio command, arguments, or cwd are outside client-mediated runtime safety bounds."
+    );
+  }
+  if (raw.env !== undefined) {
+    return clientPreflightFailure(
+      "APCI-RUNTIME-CLIENT-003",
+      location,
+      "Client-mediated MCP execution does not pass package-declared environment metadata."
+    );
+  }
+
+  const canonicalRoot = await realpath(root).catch(() => undefined);
+  if (!canonicalRoot || !await clientMcpArgsStayContained(canonicalRoot, args)) {
+    return clientPreflightFailure(
+      "APCI-RUNTIME-CLIENT-004",
+      location,
+      "Client-mediated MCP arguments contain an escaped, traversing, missing, or symlinked filesystem path."
+    );
+  }
+
+  return { ok: true, target: { name: rawName, location } };
+}
+
+async function clientMcpArgsStayContained(canonicalRoot: string, args: readonly string[]): Promise<boolean> {
+  for (const argument of args) {
+    if (/(?:^|[\\/])\.\.(?:[\\/]|$)/.test(argument)) return false;
+    if (!isAbsolute(argument)) continue;
+    const info = await readStats(argument);
+    if (!info.info?.isFile() || info.info.isSymbolicLink()) return false;
+    const canonicalArgument = await realpath(argument).catch(() => undefined);
+    if (!canonicalArgument) return false;
+    const pathFromRoot = relative(canonicalRoot, canonicalArgument);
+    if (pathFromRoot === ".." || pathFromRoot.startsWith(`..${sep}`) || isAbsolute(pathFromRoot)) return false;
+  }
+  return true;
+}
+
+function clientPreflightFailure(
+  code: string,
+  location: string,
+  summary: string
+): Extract<ClientMcpStdioPreflight, { ok: false }> {
+  return { code, location: safeText(location), ok: false, summary: safeText(summary) };
+}
+
 export async function assessPackageRuntimeCompatibility(
   packageDir: string,
   options: RuntimeCompatibilityOptions = {}

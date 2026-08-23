@@ -16,7 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   VSCODE_COPILOT_CLIENT_RUNTIME_TARGET_ID,
   type ClientRuntimeAdapter,
@@ -24,6 +24,7 @@ import {
   type ClientRuntimeAdapterOutput,
   type ClientRuntimeExecutionStatus
 } from "./client-runtime.js";
+import { preflightSingleClientMcpStdioTarget } from "./runtime.js";
 
 export const VSCODE_CLIENT_RUNTIME_ADAPTER_ID = VSCODE_COPILOT_CLIENT_RUNTIME_TARGET_ID;
 export const VSCODE_CLIENT_RUNTIME_REQUIRED_CAPABILITIES = Object.freeze([
@@ -34,7 +35,7 @@ export const VSCODE_CLIENT_RUNTIME_REQUIRED_CAPABILITIES = Object.freeze([
   "network"
 ] as const);
 
-const ADAPTER_VERSION = "1.2.0";
+const ADAPTER_VERSION = "1.3.0";
 const MIN_OBSERVATION_MS = 100;
 const MAX_OBSERVATION_MS = 20_000;
 const DEFAULT_OBSERVATION_MS = 7_500;
@@ -59,17 +60,14 @@ const OBSERVER_DIRECTORY = "agent-plugin-ci.agent-plugin-ci-runtime-observer-1.0
 const OBSERVER_EXTENSION_ID = "agent-plugin-ci.agent-plugin-ci-runtime-observer";
 const OBSERVER_MARKER_FILENAME = "consumer-surface-exercised.marker";
 const OBSERVER_MARKER_CONTENT = "agent-plugin-ci:consumer-surface-exercised:v1\n";
-const OBSERVER_MANIFEST = `${JSON.stringify({
-  name: "agent-plugin-ci-runtime-observer",
-  displayName: "Agent Plugin CI Runtime Observer",
-  description: "Activates a trusted built-in VS Code Agent Plugin consumer surface in an isolated runtime evidence session.",
-  version: "1.0.0",
-  publisher: "agent-plugin-ci",
-  engines: { vscode: "^1.100.0" },
-  main: "./extension.js",
-  activationEvents: ["*"]
-}, null, 2)}\n`;
-const OBSERVER_SOURCE = `"use strict";
+const OBSERVER_MCP_EVIDENCE_FILENAME = "client-mediated-mcp-evidence.json";
+const OBSERVER_MCP_EVIDENCE_SCHEMA_VERSION = "1.0.0";
+const MAX_OBSERVER_MCP_EVIDENCE_BYTES = 16 * 1024;
+const MAX_OBSERVED_MCP_TOOLS = 64;
+const OBSERVER_MANIFEST_VERSION = "1.0.0";
+const LOAD_ONLY_OBSERVER_MANIFEST = observerManifest(false);
+const MCP_OBSERVER_MANIFEST = observerManifest(true);
+const LOAD_ONLY_OBSERVER_SOURCE = `"use strict";
 const fs = require("node:fs");
 const path = require("node:path");
 const vscode = require("vscode");
@@ -88,6 +86,90 @@ async function activate(context) {
 
 exports.activate = activate;
 `;
+
+function observerManifest(enableMcpObservation: boolean): string {
+  return `${JSON.stringify({
+  name: "agent-plugin-ci-runtime-observer",
+  displayName: "Agent Plugin CI Runtime Observer",
+  description: "Activates a trusted built-in VS Code Agent Plugin consumer surface in an isolated runtime evidence session.",
+  version: OBSERVER_MANIFEST_VERSION,
+  publisher: "agent-plugin-ci",
+  engines: { vscode: "^1.100.0" },
+  main: "./extension.js",
+  activationEvents: ["*"],
+  ...(enableMcpObservation ? { enabledApiProposals: ["chatParticipantAdditions"] } : {})
+}, null, 2)}\n`;
+}
+
+function mcpObserverSource(packageRoot: string, expectedServerLabel: string): string {
+  return `"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const vscode = require("vscode");
+
+const MARKER_FILENAME = ${JSON.stringify(OBSERVER_MARKER_FILENAME)};
+const MARKER_CONTENT = ${JSON.stringify(OBSERVER_MARKER_CONTENT)};
+const EVIDENCE_FILENAME = ${JSON.stringify(OBSERVER_MCP_EVIDENCE_FILENAME)};
+const EVIDENCE_SCHEMA_VERSION = ${JSON.stringify(OBSERVER_MCP_EVIDENCE_SCHEMA_VERSION)};
+const PACKAGE_ROOT = ${JSON.stringify(packageRoot)};
+const EXPECTED_SERVER_LABEL = ${JSON.stringify(expectedServerLabel)};
+const MAX_TOOLS = ${MAX_OBSERVED_MCP_TOOLS};
+
+function matchingTools() {
+  const McpSource = vscode.LanguageModelToolMCPSource;
+  if (typeof McpSource !== "function" || !Array.isArray(vscode.lm.tools)) return [];
+  return vscode.lm.tools
+    .filter((tool) => tool && typeof tool.name === "string"
+      && tool.name.length > 0 && tool.name.length <= 240
+      && tool.source instanceof McpSource
+      && tool.source.label === EXPECTED_SERVER_LABEL
+      && typeof tool.source.name === "string"
+      && tool.source.name.length > 0 && tool.source.name.length <= 240)
+    .slice(0, MAX_TOOLS)
+    .map((tool) => ({
+      name: tool.name,
+      sourceLabel: tool.source.label,
+      sourceName: tool.source.name
+    }));
+}
+
+async function activate(context) {
+  const consumerInvocation = vscode.commands.executeCommand("aiCustomization.openManagementEditor");
+  fs.writeFileSync(path.join(context.extensionPath, MARKER_FILENAME), MARKER_CONTENT, {
+    encoding: "utf8",
+    flag: "wx"
+  });
+  await consumerInvocation;
+  const serverId = "plugin." + vscode.Uri.file(PACKAGE_ROOT).toString() + "." + EXPECTED_SERVER_LABEL;
+  const before = new Set(matchingTools().map((tool) => tool.name));
+  let tools = [];
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    await vscode.commands.executeCommand("workbench.mcp.startServer", serverId, {
+      waitForLiveTools: true,
+      autoTrustChanges: false
+    });
+    tools = matchingTools();
+    if (tools.length > 0) break;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
+  }
+  const evidence = {
+    schemaVersion: EVIDENCE_SCHEMA_VERSION,
+    expectedServerLabel: EXPECTED_SERVER_LABEL,
+    serverId,
+    startCommandCompleted: true,
+    matchingToolCount: tools.length,
+    newlyExposedToolCount: tools.filter((tool) => !before.has(tool.name)).length,
+    tools
+  };
+  fs.writeFileSync(path.join(context.extensionPath, EVIDENCE_FILENAME), JSON.stringify(evidence), {
+    encoding: "utf8",
+    flag: "wx"
+  });
+}
+
+exports.activate = activate;
+`;
+}
 
 interface RuntimeChildProcess {
   readonly pid?: number;
@@ -119,6 +201,8 @@ export interface VscodeClientRuntimeDependencies {
 export interface VscodeClientRuntimeAdapterOptions {
   executablePath: string;
   observationWindowMs?: number;
+  /** Executes the package's single preflighted stdio server through VS Code. Disabled by default. */
+  allowMcpRuntime?: boolean;
   dependencies?: Partial<VscodeClientRuntimeDependencies>;
 }
 
@@ -131,6 +215,10 @@ interface AdapterState {
   extensionsDir: string;
   observerRoot: string;
   observerMarker: string;
+  observerMcpEvidence: string;
+  observerManifest: string;
+  observerSource: string;
+  mcpTargetName?: string;
   homeDir: string;
   observationFile: string;
   environment: NodeJS.ProcessEnv;
@@ -223,6 +311,7 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
 
   readonly #configuredExecutablePath: string;
   readonly #observationWindowMs: number;
+  readonly #allowMcpRuntime: boolean;
   readonly #dependencies: VscodeClientRuntimeDependencies;
   #state?: AdapterState;
   #active?: LaunchedProcess;
@@ -237,6 +326,7 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
       throw new Error(`VS Code observation window must be an integer from ${MIN_OBSERVATION_MS} to ${MAX_OBSERVATION_MS} milliseconds`);
     }
     this.#observationWindowMs = observationWindowMs;
+    this.#allowMcpRuntime = options.allowMcpRuntime ?? false;
     this.#dependencies = { ...DEFAULT_DEPENDENCIES, ...options.dependencies };
   }
 
@@ -249,12 +339,24 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
       this.#dependencies.platform
     );
     const packageRoot = await validatePackageRoot(context.packageRoot);
+    const mcpPreflight = this.#allowMcpRuntime
+      ? await preflightSingleClientMcpStdioTarget(packageRoot)
+      : undefined;
+    if (mcpPreflight && !mcpPreflight.ok) {
+      throw new Error("VS Code client-mediated MCP preflight rejected the package runtime target");
+    }
+    const mcpTargetName = mcpPreflight?.ok ? mcpPreflight.target.name : undefined;
     const tempBase = resolve(this.#dependencies.tempDirectory());
     const tempRoot = await mkdtemp(join(tempBase, TEMP_PREFIX));
     const userDataDir = join(tempRoot, "user-data");
     const extensionsDir = join(tempRoot, "extensions");
     const observerRoot = join(extensionsDir, OBSERVER_DIRECTORY);
     const observerMarker = join(observerRoot, OBSERVER_MARKER_FILENAME);
+    const observerMcpEvidence = join(observerRoot, OBSERVER_MCP_EVIDENCE_FILENAME);
+    const expectedObserverManifest = mcpTargetName ? MCP_OBSERVER_MANIFEST : LOAD_ONLY_OBSERVER_MANIFEST;
+    const expectedObserverSource = mcpTargetName
+      ? mcpObserverSource(packageRoot, mcpTargetName)
+      : LOAD_ONLY_OBSERVER_SOURCE;
     const homeDir = join(tempRoot, "home");
     const observationFile = join(tempRoot, "observation.txt");
     const directories = [
@@ -271,17 +373,28 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
       extensionsDir,
       observerRoot,
       observerMarker,
+      observerMcpEvidence,
+      observerManifest: expectedObserverManifest,
+      observerSource: expectedObserverSource,
+      ...(mcpTargetName ? { mcpTargetName } : {}),
       homeDir,
       observationFile,
       environment: isolatedEnvironment(this.#dependencies.environment, tempRoot, homeDir)
     };
     for (const directory of directories) await mkdir(directory, { recursive: true });
-    await materializeObserver(tempRoot, extensionsDir, observerRoot);
+    await materializeObserver(
+      tempRoot,
+      extensionsDir,
+      observerRoot,
+      expectedObserverManifest,
+      expectedObserverSource
+    );
 
     const settings = {
       "chat.plugins.enabled": true,
       "chat.pluginLocations": { [packageRoot]: true },
-      "chat.mcp.access": "none",
+      "chat.mcp.access": mcpTargetName ? "all" : "none",
+      ...(mcpTargetName ? { "chat.mcp.autostart": "never" } : {}),
       "chat.plugins.marketplaces": [],
       "telemetry.telemetryLevel": "off",
       "update.mode": "none",
@@ -332,7 +445,14 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
         "--wait",
         state.observationFile
       ];
-      await validateObserverMaterialization(state.tempRoot, state.extensionsDir, state.observerRoot, true);
+      await validateObserverMaterialization(
+        state.tempRoot,
+        state.extensionsDir,
+        state.observerRoot,
+        state.observerManifest,
+        state.observerSource,
+        true
+      );
       const guiLauncher = await prepareWindowsShadowLauncher(
         this.#dependencies,
         state,
@@ -352,26 +472,28 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
 
       // Drain bounded process output, but never use arbitrary process text as package-load evidence.
       launched.output();
-      const observerActivated = await validateObserverMarker(state.tempRoot, state.observerRoot, state.observerMarker);
+      const observerActivated = await validateObserverMarker(state);
       const trustedClientLogs = await collectVscodeLogs(state.userDataDir);
       const matches = observerActivated ? qualifyingLoadRecords(trustedClientLogs, state.packageRoot) : 0;
       const observed = observerActivated && matches > 0;
       const clientLoad = !observerActivated ? "unknown" : observed ? "observed" : "not-observed";
-      return loadOnlyOutput(
-        observed ? "pass" : "unknown",
-        clientLoad,
-        versionObservation.version,
-        [
+      const evidenceItems = [
           evidence(
             "APCI-CLIENT-VSCODE-REGISTER-001",
             "vscode/local-registration",
             "The package was registered through isolated chat.pluginLocations; local registration is not package installation."
           ),
-          evidence(
-            "APCI-CLIENT-VSCODE-MCP-DISABLED-001",
-            "vscode/settings",
-            "The isolated observation session set chat.mcp.access to none; MCP startup, handshake, and tool exposure were not assessed."
-          ),
+          state.mcpTargetName
+            ? evidence(
+              "APCI-CLIENT-VSCODE-MCP-ENABLED-001",
+              "vscode/settings",
+              "The isolated session explicitly enabled MCP while disabling autostart; the trusted observer requested only the exact preflighted server."
+            )
+            : evidence(
+              "APCI-CLIENT-VSCODE-MCP-DISABLED-001",
+              "vscode/settings",
+              "The isolated observation session set chat.mcp.access to none; MCP startup, handshake, and tool exposure were not assessed."
+            ),
           evidence(
             "APCI-CLIENT-VSCODE-VERSION-001",
             "vscode/version",
@@ -405,7 +527,41 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
               "vscode/client-logs",
               "No package-loading claim was made because observer activation was not proven."
             )
-        ],
+        ];
+      if (!state.mcpTargetName) {
+        return loadOnlyOutput(
+          observed ? "pass" : "unknown",
+          clientLoad,
+          versionObservation.version,
+          evidenceItems,
+          observerActivated
+        );
+      }
+
+      const mcpObservation = observerActivated
+        ? await validateMcpObserverEvidence(state)
+        : { status: "unknown" as const, matchingToolCount: 0, newlyExposedToolCount: 0 };
+      evidenceItems.push(mcpObservation.status === "observed"
+        ? evidence(
+          "APCI-CLIENT-VSCODE-MCP-OBSERVED-001",
+          "vscode/observer-api",
+          `VS Code completed the exact client start request and exposed ${mcpObservation.matchingToolCount} MCP tool(s), including ${mcpObservation.newlyExposedToolCount} newly observed tool(s), through an exactly matching MCP source.`
+        )
+        : evidence(
+          mcpObservation.status === "not-observed"
+            ? "APCI-CLIENT-VSCODE-MCP-OBSERVED-002"
+            : "APCI-CLIENT-VSCODE-MCP-OBSERVED-003",
+          "vscode/observer-api",
+          mcpObservation.status === "not-observed"
+            ? "The trusted VS Code observer completed without an exactly attributable MCP tool; startup, handshake, and tool exposure were not observed."
+            : "The trusted VS Code observer did not produce valid bounded MCP evidence; no MCP lifecycle claim was made."
+        ));
+      return clientMcpOutput(
+        observed && mcpObservation.status === "observed" ? "pass" : "unknown",
+        clientLoad,
+        mcpObservation.status,
+        versionObservation.version,
+        evidenceItems,
         observerActivated
       );
     } catch (error) {
@@ -960,24 +1116,33 @@ async function preflightPackageTree(canonicalRoot: string): Promise<void> {
 async function materializeObserver(
   tempRoot: string,
   extensionsDir: string,
-  observerRoot: string
+  observerRoot: string,
+  expectedManifest: string,
+  expectedSource: string
 ): Promise<void> {
   if (observerRoot !== join(extensionsDir, OBSERVER_DIRECTORY) || !isWithin(tempRoot, observerRoot)) {
     throw new Error("VS Code observer materialization path escaped isolated client state");
   }
   const registry = observerRegistry(observerRoot);
   await mkdir(observerRoot);
-  await writeFile(join(observerRoot, "package.json"), OBSERVER_MANIFEST, { encoding: "utf8", flag: "wx" });
-  await writeFile(join(observerRoot, "extension.js"), OBSERVER_SOURCE, { encoding: "utf8", flag: "wx" });
+  await writeFile(join(observerRoot, "package.json"), expectedManifest, { encoding: "utf8", flag: "wx" });
+  await writeFile(join(observerRoot, "extension.js"), expectedSource, { encoding: "utf8", flag: "wx" });
   await writeFile(join(extensionsDir, "extensions.json"), registry, { encoding: "utf8", flag: "wx" });
-  await validateObserverMaterialization(tempRoot, extensionsDir, observerRoot, true);
+  await validateObserverMaterialization(
+    tempRoot,
+    extensionsDir,
+    observerRoot,
+    expectedManifest,
+    expectedSource,
+    true
+  );
 }
 
 function observerRegistry(observerRoot: string): string {
   const location = pathToFileURL(observerRoot);
   return `${JSON.stringify([{
     identifier: { id: OBSERVER_EXTENSION_ID },
-    version: "1.0.0",
+    version: OBSERVER_MANIFEST_VERSION,
     location: {
       $mid: 1,
       path: decodeURIComponent(location.pathname),
@@ -991,6 +1156,8 @@ async function validateObserverMaterialization(
   tempRoot: string,
   extensionsDir: string,
   observerRoot: string,
+  expectedManifest: string,
+  expectedSource: string,
   requireMissingMarker: boolean
 ): Promise<void> {
   if (extensionsDir !== join(tempRoot, "extensions")
@@ -1017,24 +1184,24 @@ async function validateObserverMaterialization(
   const manifestPath = await validateContainedRegularFile(
     canonicalObserverRoot,
     ["package.json"],
-    Buffer.byteLength(OBSERVER_MANIFEST)
+    Buffer.byteLength(expectedManifest)
   );
   const sourcePath = await validateContainedRegularFile(
     canonicalObserverRoot,
     ["extension.js"],
-    Buffer.byteLength(OBSERVER_SOURCE)
+    Buffer.byteLength(expectedSource)
   );
   const manifest = await readBoundedTrustedFile(
     manifestPath,
     canonicalObserverRoot,
-    Buffer.byteLength(OBSERVER_MANIFEST)
+    Buffer.byteLength(expectedManifest)
   );
   const source = await readBoundedTrustedFile(
     sourcePath,
     canonicalObserverRoot,
-    Buffer.byteLength(OBSERVER_SOURCE)
+    Buffer.byteLength(expectedSource)
   );
-  if (manifest !== OBSERVER_MANIFEST || source !== OBSERVER_SOURCE) {
+  if (manifest !== expectedManifest || source !== expectedSource) {
     throw new Error("VS Code observer materialization content did not match its trusted definition");
   }
   if (requireMissingMarker) {
@@ -1054,24 +1221,29 @@ async function validateObserverMaterialization(
     }
     const markerInfo = await lstatIfPresent(join(canonicalObserverRoot, OBSERVER_MARKER_FILENAME));
     if (markerInfo) throw new Error("VS Code observer marker existed before the client observation session");
+    const mcpEvidenceInfo = await lstatIfPresent(join(canonicalObserverRoot, OBSERVER_MCP_EVIDENCE_FILENAME));
+    if (mcpEvidenceInfo) throw new Error("VS Code observer MCP evidence existed before the client observation session");
   }
 }
 
-async function validateObserverMarker(tempRoot: string, observerRoot: string, markerPath: string): Promise<boolean> {
-  const markerInfo = await lstatIfPresent(markerPath);
+async function validateObserverMarker(state: AdapterState): Promise<boolean> {
+  const markerInfo = await lstatIfPresent(state.observerMarker);
   if (!markerInfo) return false;
-  if (markerPath !== join(observerRoot, OBSERVER_MARKER_FILENAME) || !isWithin(tempRoot, markerPath)
+  if (state.observerMarker !== join(state.observerRoot, OBSERVER_MARKER_FILENAME)
+    || !isWithin(state.tempRoot, state.observerMarker)
     || !markerInfo.isFile() || markerInfo.isSymbolicLink()
     || markerInfo.size !== Buffer.byteLength(OBSERVER_MARKER_CONTENT)) {
     throw new Error("VS Code observer marker was outside trusted bounds");
   }
   await validateObserverMaterialization(
-    tempRoot,
-    join(tempRoot, "extensions"),
-    observerRoot,
+    state.tempRoot,
+    state.extensionsDir,
+    state.observerRoot,
+    state.observerManifest,
+    state.observerSource,
     false
   );
-  const canonicalObserverRoot = await realpath(observerRoot);
+  const canonicalObserverRoot = await realpath(state.observerRoot);
   const canonicalMarkerPath = await validateContainedRegularFile(
     canonicalObserverRoot,
     [OBSERVER_MARKER_FILENAME],
@@ -1086,6 +1258,106 @@ async function validateObserverMarker(tempRoot: string, observerRoot: string, ma
     throw new Error("VS Code observer marker content was not trusted");
   }
   return true;
+}
+
+async function validateMcpObserverEvidence(state: AdapterState): Promise<{
+  status: "observed" | "not-observed" | "unknown";
+  matchingToolCount: number;
+  newlyExposedToolCount: number;
+}> {
+  if (!state.mcpTargetName) {
+    return { status: "unknown", matchingToolCount: 0, newlyExposedToolCount: 0 };
+  }
+  const evidenceInfo = await lstatIfPresent(state.observerMcpEvidence);
+  if (!evidenceInfo) {
+    return { status: "unknown", matchingToolCount: 0, newlyExposedToolCount: 0 };
+  }
+  if (state.observerMcpEvidence !== join(state.observerRoot, OBSERVER_MCP_EVIDENCE_FILENAME)
+    || !isWithin(state.tempRoot, state.observerMcpEvidence)
+    || !evidenceInfo.isFile() || evidenceInfo.isSymbolicLink()
+    || evidenceInfo.size <= 0 || evidenceInfo.size > MAX_OBSERVER_MCP_EVIDENCE_BYTES) {
+    throw new Error("VS Code observer MCP evidence was outside trusted bounds");
+  }
+  await validateObserverMaterialization(
+    state.tempRoot,
+    state.extensionsDir,
+    state.observerRoot,
+    state.observerManifest,
+    state.observerSource,
+    false
+  );
+  const canonicalObserverRoot = await realpath(state.observerRoot);
+  const canonicalEvidencePath = await validateContainedRegularFile(
+    canonicalObserverRoot,
+    [OBSERVER_MCP_EVIDENCE_FILENAME],
+    MAX_OBSERVER_MCP_EVIDENCE_BYTES
+  );
+  const rawEvidence = await readBoundedTrustedFile(
+    canonicalEvidencePath,
+    canonicalObserverRoot,
+    MAX_OBSERVER_MCP_EVIDENCE_BYTES
+  );
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawEvidence);
+  } catch {
+    throw new Error("VS Code observer MCP evidence was not valid JSON");
+  }
+  if (!isRecord(parsed)
+    || parsed.schemaVersion !== OBSERVER_MCP_EVIDENCE_SCHEMA_VERSION
+    || parsed.expectedServerLabel !== state.mcpTargetName
+    || typeof parsed.serverId !== "string"
+    || !validExpectedMcpServerId(parsed.serverId, state.packageRoot, state.mcpTargetName)
+    || parsed.startCommandCompleted !== true
+    || !Number.isInteger(parsed.matchingToolCount)
+    || !Number.isInteger(parsed.newlyExposedToolCount)
+    || !Array.isArray(parsed.tools)
+    || parsed.tools.length > MAX_OBSERVED_MCP_TOOLS
+    || parsed.matchingToolCount !== parsed.tools.length
+    || (parsed.newlyExposedToolCount as number) < 0
+    || (parsed.newlyExposedToolCount as number) > parsed.tools.length) {
+    throw new Error("VS Code observer MCP evidence did not match its bounded contract");
+  }
+  const toolNames = new Set<string>();
+  const sourceNames = new Set<string>();
+  for (const rawTool of parsed.tools) {
+    if (!isRecord(rawTool)
+      || typeof rawTool.name !== "string" || !validObserverText(rawTool.name)
+      || rawTool.sourceLabel !== state.mcpTargetName
+      || typeof rawTool.sourceName !== "string" || !validObserverText(rawTool.sourceName)
+      || toolNames.has(rawTool.name)) {
+      throw new Error("VS Code observer MCP tool evidence was malformed or ambiguous");
+    }
+    toolNames.add(rawTool.name);
+    sourceNames.add(rawTool.sourceName);
+  }
+  if (sourceNames.size > 1) throw new Error("VS Code observer MCP tool evidence was malformed or ambiguous");
+  const matchingToolCount = parsed.matchingToolCount as number;
+  const newlyExposedToolCount = parsed.newlyExposedToolCount as number;
+  return {
+    status: matchingToolCount > 0 && newlyExposedToolCount > 0 ? "observed" : "not-observed",
+    matchingToolCount,
+    newlyExposedToolCount
+  };
+}
+
+function validExpectedMcpServerId(serverId: string, packageRoot: string, targetName: string): boolean {
+  const prefix = "plugin.";
+  const suffix = `.${targetName}`;
+  if (serverId.length > MAX_PATH_LENGTH + targetName.length + prefix.length + 16
+    || !serverId.startsWith(prefix) || !serverId.endsWith(suffix)) return false;
+  const rawUri = serverId.slice(prefix.length, -suffix.length);
+  try {
+    const uri = new URL(rawUri);
+    if (uri.protocol !== "file:" || uri.username || uri.password || uri.search || uri.hash) return false;
+    return sameCanonicalPath(fileURLToPath(uri), packageRoot, process.platform);
+  } catch {
+    return false;
+  }
+}
+
+function validObserverText(value: string): boolean {
+  return value.length > 0 && value.length <= 240 && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
 function isolatedEnvironment(source: NodeJS.ProcessEnv, tempRoot: string, homeDir: string): NodeJS.ProcessEnv {
@@ -1447,6 +1719,28 @@ function loadOnlyOutput(
   };
 }
 
+function clientMcpOutput(
+  status: ClientRuntimeAdapterOutput["status"],
+  clientLoad: ClientRuntimeAdapterOutput["clientLoad"],
+  mcpObservation: "observed" | "not-observed" | "unknown",
+  targetClientVersion: string,
+  evidenceItems: ClientRuntimeAdapterOutput["evidence"],
+  complete: boolean
+): ClientRuntimeAdapterOutput {
+  return {
+    status,
+    complete,
+    packageInstall: "not-observed",
+    clientLoad,
+    mcpStartup: mcpObservation,
+    mcpHandshake: mcpObservation,
+    toolExposure: mcpObservation,
+    interoperability: "not-established",
+    targetClientVersion,
+    evidence: evidenceItems
+  };
+}
+
 function evidence(code: string, location: string, summary: string) {
   return { code, location, summary };
 }
@@ -1461,4 +1755,8 @@ function safeTemporaryRoot(tempBase: string, candidate: string): boolean {
 function isWithin(root: string, candidate: string): boolean {
   const path = relative(resolve(root), resolve(candidate));
   return path === "" || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

@@ -1,0 +1,6 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "phase3f-vscode-client-runtime-fixture",
+  "version": "1.0.0",
+  "description": "Deterministic repository-controlled VS Code client-mediated MCP fixture."
+}

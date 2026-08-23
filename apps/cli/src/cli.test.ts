@@ -495,7 +495,37 @@ describe("Agent Plugin CI CLI", () => {
     expect(help).toContain("--allow-client-process");
     expect(help).toContain("--allow-client-filesystem");
     expect(help).toContain("--allow-client-network");
+    expect(help).toContain("--allow-client-mcp-runtime");
     expect(help).toContain("MCP disabled");
+  });
+
+  it("requires a separate VS Code-only opt-in for client-mediated MCP execution", async () => {
+    const withoutLifecycle = capture();
+    expect(await runCli([
+      "compat-runtime", ".",
+      "--client-adapter", "vscode-github-copilot",
+      "--client-executable", process.execPath,
+      "--allow-client-mcp-runtime",
+      "--json"
+    ], withoutLifecycle.io)).toBe(2);
+    expect(JSON.parse(withoutLifecycle.stdout[0]!).error.message).toContain("also requires --allow-client-runtime");
+
+    const synthetic = capture();
+    expect(await runCli([
+      "compat-runtime", ".",
+      "--client-adapter", "synthetic-fixture",
+      "--allow-client-runtime",
+      "--allow-synthetic-fixture",
+      "--allow-client-mcp-runtime",
+      "--json"
+    ], synthetic.io)).toBe(2);
+    expect(JSON.parse(synthetic.stdout[0]!).error.message).toContain("accepts no executable path or client capability grants");
+
+    const withoutAdapter = capture();
+    expect(await runCli([
+      "compat-runtime", ".", "--allow-client-mcp-runtime", "--json"
+    ], withoutAdapter.io)).toBe(2);
+    expect(JSON.parse(withoutAdapter.stdout[0]!).error.message).toContain("require --client-adapter");
   });
 
   it("requires a bounded absolute executable path for the VS Code adapter", async () => {

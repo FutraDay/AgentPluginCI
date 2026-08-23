@@ -17,6 +17,7 @@ const packageRoots: string[] = [];
 const OBSERVER_DIRECTORY = "agent-plugin-ci.agent-plugin-ci-runtime-observer-1.0.0";
 const OBSERVER_MARKER_FILENAME = "consumer-surface-exercised.marker";
 const OBSERVER_MARKER_CONTENT = "agent-plugin-ci:consumer-surface-exercised:v1\n";
+const OBSERVER_MCP_EVIDENCE_FILENAME = "client-mediated-mcp-evidence.json";
 
 afterEach(async () => {
   for (const root of packageRoots.splice(0)) await rm(root, { recursive: true, force: true });
@@ -26,12 +27,117 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
   it("declares the real target and all conservative opt-in capabilities", () => {
     const adapter = createVscodeClientRuntimeAdapter({ executablePath: process.execPath });
     expect(adapter.metadata).toEqual({
-      adapter: { id: "vscode-github-copilot", version: "1.2.0" },
+      adapter: { id: "vscode-github-copilot", version: "1.3.0" },
       targetClient: { id: "vscode-github-copilot", name: "VS Code/GitHub Copilot" },
       synthetic: false,
       requiredCapabilities: ["package-read", "client-process", "client-filesystem", "network"]
     });
     expect(VSCODE_CLIENT_RUNTIME_REQUIRED_CAPABILITIES).toEqual(adapter.metadata.requiredCapabilities);
+  });
+
+  it("keeps client-mediated MCP denied independently of the generic client lifecycle", async () => {
+    const packageRoot = await createPackage({ mcpServerName: "phase3f-fixture" });
+    const fake = fakeRuntime(packageRoot);
+    const report = await runClientRuntimeHarness(packageRoot, createVscodeClientRuntimeAdapter({
+      executablePath: process.execPath,
+      allowMcpRuntime: true,
+      dependencies: fake.dependencies
+    }), {
+      grantedCapabilities: [...VSCODE_CLIENT_RUNTIME_REQUIRED_CAPABILITIES]
+    });
+
+    expect(report.execution).toEqual({ status: "denied", complete: false, finalize: "not-run" });
+    expect(report.mcpStartup).toBe("not-assessed");
+    expect(fake.invocations).toEqual([]);
+  });
+
+  it("reports exactly attributable client-mediated startup, handshake, and tool exposure", async () => {
+    const serverName = "phase3f-fixture";
+    const packageRoot = await createPackage({ mcpServerName: serverName });
+    const fake = fakeRuntime(packageRoot, { mcpEvidence: validMcpEvidence(packageRoot, serverName) });
+    const report = await runClientRuntimeHarness(packageRoot, createVscodeClientRuntimeAdapter({
+      executablePath: process.execPath,
+      observationWindowMs: 100,
+      allowMcpRuntime: true,
+      dependencies: fake.dependencies
+    }), {
+      allowExecution: true,
+      grantedCapabilities: [...VSCODE_CLIENT_RUNTIME_REQUIRED_CAPABILITIES],
+      timeoutMs: 2_000
+    });
+
+    expect(report).toMatchObject({
+      execution: { status: "pass", complete: true, finalize: "complete" },
+      packageInstall: "not-observed",
+      clientLoad: "observed",
+      mcpStartup: "observed",
+      mcpHandshake: "observed",
+      toolExposure: "observed",
+      interoperability: "not-established"
+    });
+    expect(report.evidence.map((item) => item.code)).toContain("APCI-CLIENT-VSCODE-MCP-OBSERVED-001");
+    const settings = JSON.parse(await fake.settingsReads[0]!) as Record<string, unknown>;
+    expect(settings["chat.mcp.access"]).toBe("all");
+    expect(settings["chat.mcp.autostart"]).toBe("never");
+    const observerManifest = JSON.parse(await fake.observerManifestReads[0]!) as Record<string, unknown>;
+    expect(observerManifest.enabledApiProposals).toEqual(["chatParticipantAdditions"]);
+    const observerSource = await fake.observerSourceReads[0]!;
+    expect(observerSource).toContain('executeCommand("workbench.mcp.startServer", serverId');
+    expect(observerSource).toContain("LanguageModelToolMCPSource");
+    expect(observerSource).toContain("waitForLiveTools: true");
+    expect(JSON.stringify(report)).not.toContain(packageRoot);
+  });
+
+  it("rejects malformed or ambiguous client-mediated MCP observer evidence", async () => {
+    const serverName = "phase3f-fixture";
+    const packageRoot = await createPackage({ mcpServerName: serverName });
+    for (const mcpEvidence of [
+      "{not-json",
+      validMcpEvidence(packageRoot, serverName, [
+        { name: "duplicate", sourceLabel: serverName, sourceName: "fixture" },
+        { name: "duplicate", sourceLabel: serverName, sourceName: "fixture" }
+      ]),
+      validMcpEvidence(packageRoot, serverName, [
+        { name: "first", sourceLabel: serverName, sourceName: "source-a" },
+        { name: "second", sourceLabel: serverName, sourceName: "source-b" }
+      ])
+    ]) {
+      const fake = fakeRuntime(packageRoot, { mcpEvidence });
+      const report = await runClientRuntimeHarness(packageRoot, createVscodeClientRuntimeAdapter({
+        executablePath: process.execPath,
+        observationWindowMs: 100,
+        allowMcpRuntime: true,
+        dependencies: fake.dependencies
+      }), {
+        allowExecution: true,
+        grantedCapabilities: [...VSCODE_CLIENT_RUNTIME_REQUIRED_CAPABILITIES],
+        timeoutMs: 2_000
+      });
+      expect(report.execution).toEqual({ status: "fail", complete: false, finalize: "complete" });
+      expect(report.mcpHandshake).toBe("unknown");
+      expect(report.toolExposure).toBe("unknown");
+      expect(JSON.stringify(report)).not.toContain("duplicate");
+    }
+  });
+
+  it("makes no MCP lifecycle claim when the trusted observer produces no MCP evidence", async () => {
+    const packageRoot = await createPackage({ mcpServerName: "phase3f-fixture" });
+    const fake = fakeRuntime(packageRoot);
+    const report = await runClientRuntimeHarness(packageRoot, createVscodeClientRuntimeAdapter({
+      executablePath: process.execPath,
+      observationWindowMs: 100,
+      allowMcpRuntime: true,
+      dependencies: fake.dependencies
+    }), {
+      allowExecution: true,
+      grantedCapabilities: [...VSCODE_CLIENT_RUNTIME_REQUIRED_CAPABILITIES],
+      timeoutMs: 2_000
+    });
+    expect(report.clientLoad).toBe("observed");
+    expect(report.mcpStartup).toBe("unknown");
+    expect(report.mcpHandshake).toBe("unknown");
+    expect(report.toolExposure).toBe("unknown");
+    expect(report.interoperability).toBe("not-established");
   });
 
   it("uses the validated bundled Windows CLI for version and a strictly derived shadow executable for GUI loading", async () => {
@@ -79,7 +185,7 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
     });
 
     expect(report).toMatchObject({
-      adapter: { version: "1.2.0" },
+      adapter: { version: "1.3.0" },
       targetClient: { version: "1.118.0" },
       execution: { status: "pass", complete: true, finalize: "complete" },
       packageInstall: "not-observed",
@@ -943,6 +1049,7 @@ function fakeRuntime(
     tempDirectory?: string;
     observerActivation?: boolean;
     observerMarkerContent?: string;
+    mcpEvidence?: unknown | string;
     tamperObserverSourceDuringVersion?: boolean;
     onGuiSpawn?: (executable: string, args: readonly string[]) => void;
   } = {}
@@ -1025,6 +1132,15 @@ function fakeRuntime(
             "utf8"
           );
         }
+        if (options.mcpEvidence !== undefined) {
+          writeFileSync(
+            join(observerRoot, OBSERVER_MCP_EVIDENCE_FILENAME),
+            typeof options.mcpEvidence === "string"
+              ? options.mcpEvidence
+              : JSON.stringify(options.mcpEvidence),
+            "utf8"
+          );
+        }
         const logOutput = options.logOutput === undefined
           ? `[File Watcher (universal)] Request to start watching: ${packageRoot} (excludes: <none>)`
           : options.logOutput;
@@ -1069,13 +1185,27 @@ function fakeRuntime(
   };
 }
 
-async function createPackage(): Promise<string> {
+async function createPackage(options: { mcpServerName?: string } = {}): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "agentplugin-vscode-package-"));
   packageRoots.push(root);
   await writeFile(join(root, "plugin.json"), JSON.stringify({
     $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
     name: "vscode-fixture"
   }), "utf8");
+  if (options.mcpServerName) {
+    const mcpConfig = JSON.stringify({
+      $schema: "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+      mcpServers: {
+        [options.mcpServerName]: {
+          type: "stdio",
+          command: "node",
+          args: [join(root, "fixture-server.mjs")]
+        }
+      }
+    });
+    await writeFile(join(root, "mcp.json"), mcpConfig, "utf8");
+    await writeFile(join(root, "fixture-server.mjs"), "// controlled test fixture\n", "utf8");
+  }
   return await realpath(root);
 }
 
@@ -1126,6 +1256,22 @@ function contextFor(packageRoot: string): ClientRuntimeAdapterContext {
     packageRoot,
     signal: new AbortController().signal,
     grantedCapabilities: [...VSCODE_CLIENT_RUNTIME_REQUIRED_CAPABILITIES]
+  };
+}
+
+function validMcpEvidence(
+  packageRoot: string,
+  serverName: string,
+  tools = [{ name: "mcp_phase3f_fixture_echo", sourceLabel: serverName, sourceName: "phase3f-fixture" }]
+) {
+  return {
+    schemaVersion: "1.0.0",
+    expectedServerLabel: serverName,
+    serverId: `plugin.${pathToFileURL(packageRoot).href}.${serverName}`,
+    startCommandCompleted: true,
+    matchingToolCount: tools.length,
+    newlyExposedToolCount: tools.length,
+    tools
   };
 }
 

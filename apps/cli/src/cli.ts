@@ -293,7 +293,11 @@ async function runCompatRuntime(
   }
   const packageDir = info.isDirectory() ? resolved : dirname(resolved);
   if (client) {
-    const adapters = createCliClientAdapterRegistry(client.executablePath, options.timeoutMs);
+    const adapters = createCliClientAdapterRegistry(
+      client.executablePath,
+      options.timeoutMs,
+      client.allowMcpRuntime
+    );
     let adapter;
     try {
       adapter = adapters.get(client.adapterId);
@@ -503,6 +507,7 @@ function parseCompatRuntimeArgs(args: string[]): {
   client?: {
     adapterId: string;
     allowExecution: boolean;
+    allowMcpRuntime: boolean;
     allowSyntheticFixture: boolean;
     executablePath?: string;
     grantedCapabilities: ClientRuntimeCapability[];
@@ -514,6 +519,7 @@ function parseCompatRuntimeArgs(args: string[]): {
   let timeoutMs: number | undefined;
   let clientAdapterId: string | undefined;
   let allowClientRuntime = false;
+  let allowClientMcpRuntime = false;
   let allowSyntheticFixture = false;
   let clientExecutable: string | undefined;
   const grantedCapabilities = new Set<ClientRuntimeCapability>();
@@ -525,6 +531,7 @@ function parseCompatRuntimeArgs(args: string[]): {
     if (arg === "--allow-private-network") { options.allowPrivateNetwork = true; continue; }
     if (arg === "--allow-insecure-http") { options.allowInsecureHttp = true; continue; }
     if (arg === "--allow-client-runtime") { allowClientRuntime = true; continue; }
+    if (arg === "--allow-client-mcp-runtime") { allowClientMcpRuntime = true; continue; }
     if (arg === "--allow-synthetic-fixture") { allowSyntheticFixture = true; continue; }
     if (arg === "--allow-client-package-read") { grantedCapabilities.add("package-read"); continue; }
     if (arg === "--allow-client-process") { grantedCapabilities.add("client-process"); continue; }
@@ -572,9 +579,23 @@ function parseCompatRuntimeArgs(args: string[]): {
       );
     }
     if (clientAdapterId === "synthetic-fixture"
-      && (clientExecutable !== undefined || grantedCapabilities.size > 0)) {
+      && (clientExecutable !== undefined || grantedCapabilities.size > 0 || allowClientMcpRuntime)) {
       throw new CliError(
         "The synthetic-fixture adapter accepts no executable path or client capability grants",
+        "USAGE_ERROR",
+        2
+      );
+    }
+    if (allowClientMcpRuntime && clientAdapterId !== VSCODE_CLIENT_RUNTIME_ADAPTER_ID) {
+      throw new CliError(
+        "--allow-client-mcp-runtime is supported only by the vscode-github-copilot adapter",
+        "USAGE_ERROR",
+        2
+      );
+    }
+    if (allowClientMcpRuntime && !allowClientRuntime) {
+      throw new CliError(
+        "--allow-client-mcp-runtime also requires --allow-client-runtime",
         "USAGE_ERROR",
         2
       );
@@ -586,13 +607,15 @@ function parseCompatRuntimeArgs(args: string[]): {
       client: {
         adapterId: clientAdapterId,
         allowExecution: allowClientRuntime,
+        allowMcpRuntime: allowClientMcpRuntime,
         allowSyntheticFixture,
         ...(clientExecutable ? { executablePath: clientExecutable } : {}),
         grantedCapabilities: [...grantedCapabilities]
       }
     };
   }
-  if (allowClientRuntime || allowSyntheticFixture || clientExecutable !== undefined || grantedCapabilities.size > 0) {
+  if (allowClientRuntime || allowClientMcpRuntime || allowSyntheticFixture
+    || clientExecutable !== undefined || grantedCapabilities.size > 0) {
     throw new CliError("Client runtime opt-ins require --client-adapter", "USAGE_ERROR", 2);
   }
   return { target, json, options };
@@ -600,12 +623,14 @@ function parseCompatRuntimeArgs(args: string[]): {
 
 function createCliClientAdapterRegistry(
   executablePath?: string,
-  timeoutMs = 5_000
+  timeoutMs = 5_000,
+  allowMcpRuntime = false
 ): ClientRuntimeAdapterRegistry {
   return new ClientRuntimeAdapterRegistry([
     createSyntheticFixtureClientAdapter(),
     createVscodeClientRuntimeAdapter({
       executablePath: executablePath ?? "",
+      allowMcpRuntime,
       observationWindowMs: Math.max(100, Math.min(20_000, timeoutMs - 2_500))
     })
   ]);
@@ -1075,9 +1100,10 @@ Runtime compatibility options:
   --allow-private-network         Permit private-network remote MCP runtime targets
   --allow-insecure-http           Permit insecure HTTP remote MCP runtime targets
   --timeout-ms <100-30000>        MCP initialize or client lifecycle timeout (default: 5000)
-  --client-adapter <id>           Use synthetic-fixture or real vscode-github-copilot load adapter (MCP disabled)
+  --client-adapter <id>           Use synthetic-fixture or real vscode-github-copilot (MCP disabled by default)
   --client-executable <path>      Required absolute VS Code executable path for vscode-github-copilot
   --allow-client-runtime          Explicitly permit the selected client adapter lifecycle
+  --allow-client-mcp-runtime      Additionally permit one preflighted stdio server through VS Code (default: denied)
   --allow-client-package-read     Grant the selected adapter bounded package-root read access
   --allow-client-process          Grant the selected adapter direct client process execution
   --allow-client-filesystem       Grant isolated client state/log filesystem access

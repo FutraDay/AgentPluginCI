@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MCP_SCHEMA, PLUGIN_SCHEMA } from "@agent-plugin-ci/spec-agent-plugins-v1";
 import { describe, expect, it } from "vitest";
-import { assessPackageRuntimeCompatibility } from "./runtime.js";
+import { assessPackageRuntimeCompatibility, preflightSingleClientMcpStdioTarget } from "./runtime.js";
 
 const sdkFixture = fileURLToPath(new URL("../../ingest-mcp/test-fixtures/stdio-server.mjs", import.meta.url));
 
@@ -185,5 +185,95 @@ describe("runtime compatibility evidence", () => {
     const second = await assessPackageRuntimeCompatibility(root);
     expect(first.servers.map((server) => server.name)).toEqual(["alpha", "zeta"]);
     expect(JSON.stringify(first)).toBe(JSON.stringify(second));
+  });
+
+  it("preflights one bounded environment-free stdio target without executing it", async () => {
+    const root = await packageDir("agentplugin-client-mcp-preflight-");
+    const marker = join(root, "must-not-exist.txt");
+    const localFixture = join(root, "fixture-server.mjs");
+    await writeFile(
+      localFixture,
+      `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "executed");\n`,
+      "utf8"
+    );
+    await writeMcp(root, {
+      fixture: { type: "stdio", command: "node", args: [localFixture] }
+    });
+    await expect(preflightSingleClientMcpStdioTarget(root)).resolves.toEqual({
+      ok: true,
+      target: { name: "fixture", location: "mcp.json/mcpServers/fixture" }
+    });
+    expect(await exists(marker)).toBe(false);
+  });
+
+  it("rejects ambiguous, remote, cwd-bearing, and environment-bearing client MCP targets", async () => {
+    const cases: Array<{ servers: Record<string, unknown>; code: string }> = [
+      {
+        servers: {
+          one: { type: "stdio", command: "node" },
+          two: { type: "stdio", command: "node" }
+        },
+        code: "APCI-RUNTIME-CLIENT-001"
+      },
+      {
+        servers: { remote: { type: "streamable-http", url: "https://example.com/mcp" } },
+        code: "APCI-RUNTIME-CLIENT-002"
+      },
+      {
+        servers: { cwd: { type: "stdio", command: "node", cwd: "." } },
+        code: "APCI-RUNTIME-INPUT-003"
+      },
+      {
+        servers: { env: { type: "stdio", command: "node", env: { TOKEN: "${TOKEN}" } } },
+        code: "APCI-RUNTIME-CLIENT-003"
+      }
+    ];
+    for (const item of cases) {
+      const root = await packageDir("agentplugin-client-mcp-reject-");
+      await writeMcp(root, item.servers);
+      const result = await preflightSingleClientMcpStdioTarget(root);
+      expect(result).toMatchObject({ ok: false, code: item.code });
+    }
+  });
+
+  it("rejects escaped, missing, and symlinked absolute client MCP argument paths", async () => {
+    const externalRoot = await packageDir("agentplugin-client-mcp-external-");
+    const externalFile = join(externalRoot, "external.mjs");
+    await writeFile(externalFile, "// outside target package\n", "utf8");
+
+    const escapedRoot = await packageDir("agentplugin-client-mcp-escaped-");
+    await writeMcp(escapedRoot, { fixture: { type: "stdio", command: "node", args: [externalFile] } });
+    await expect(preflightSingleClientMcpStdioTarget(escapedRoot)).resolves.toMatchObject({
+      ok: false,
+      code: "APCI-RUNTIME-CLIENT-004"
+    });
+
+    const missingRoot = await packageDir("agentplugin-client-mcp-missing-");
+    await writeMcp(missingRoot, {
+      fixture: { type: "stdio", command: "node", args: [join(missingRoot, "missing.mjs")] }
+    });
+    await expect(preflightSingleClientMcpStdioTarget(missingRoot)).resolves.toMatchObject({
+      ok: false,
+      code: "APCI-RUNTIME-CLIENT-004"
+    });
+
+    const traversalRoot = await packageDir("agentplugin-client-mcp-traversal-");
+    await writeMcp(traversalRoot, {
+      fixture: { type: "stdio", command: "node", args: ["../outside.mjs"] }
+    });
+    await expect(preflightSingleClientMcpStdioTarget(traversalRoot)).resolves.toMatchObject({
+      ok: false,
+      code: "APCI-RUNTIME-CLIENT-004"
+    });
+
+    const symlinkRoot = await packageDir("agentplugin-client-mcp-arg-link-");
+    const link = join(symlinkRoot, "linked.mjs");
+    try { await symlink(externalFile, link, "file"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "EPERM") return; throw error; }
+    await writeMcp(symlinkRoot, { fixture: { type: "stdio", command: "node", args: [link] } });
+    await expect(preflightSingleClientMcpStdioTarget(symlinkRoot)).resolves.toMatchObject({
+      ok: false,
+      code: "APCI-RUNTIME-CLIENT-004"
+    });
   });
 });
