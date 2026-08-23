@@ -1,7 +1,7 @@
 import { spawn as nodeSpawn, type SpawnOptions } from "node:child_process";
 import { constants, lstat, mkdir, mkdtemp, open, opendir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import {
@@ -21,7 +21,7 @@ export const VSCODE_CLIENT_RUNTIME_REQUIRED_CAPABILITIES = Object.freeze([
   "network"
 ] as const);
 
-const ADAPTER_VERSION = "1.0.0";
+const ADAPTER_VERSION = "1.1.0";
 const MIN_OBSERVATION_MS = 100;
 const MAX_OBSERVATION_MS = 20_000;
 const DEFAULT_OBSERVATION_MS = 2_500;
@@ -35,6 +35,8 @@ const MAX_LOG_ENTRIES = 256;
 const MAX_LOG_DEPTH = 7;
 const MAX_PACKAGE_ENTRIES = 4_096;
 const MAX_PACKAGE_DEPTH = 16;
+const MAX_WINDOWS_LAUNCHER_BYTES = 8 * 1024;
+const MAX_WINDOWS_BUNDLED_CLI_BYTES = 16 * 1024 * 1024;
 const TEMP_PREFIX = "agentplugin-vscode-";
 
 interface RuntimeChildProcess {
@@ -78,6 +80,11 @@ interface AdapterState {
   homeDir: string;
   observationFile: string;
   environment: NodeJS.ProcessEnv;
+}
+
+interface VersionObservation {
+  version: string;
+  source: "bundled-cli" | "direct-executable";
 }
 
 type ExitResult =
@@ -193,8 +200,8 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
     const state = this.#state;
     if (!state) throw new Error("VS Code client adapter was not initialized");
     try {
-      const version = await this.#readVersion(state, context.signal);
-      if (!version) {
+      const versionObservation = await this.#readVersion(state, context.signal);
+      if (!versionObservation) {
         return loadOnlyOutput("unknown", "unknown", undefined, [
           evidence(
             "APCI-CLIENT-VSCODE-REGISTER-001",
@@ -204,7 +211,7 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
           evidence(
             "APCI-CLIENT-VSCODE-VERSION-002",
             "vscode/version",
-            "The supplied executable did not emit a bounded recognizable VS Code version, so client loading was not attempted."
+            "No bounded recognizable VS Code version was available from a trusted version source, so client loading was not attempted."
           )
         ]);
       }
@@ -230,7 +237,7 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
       const clientEvidence = `${launched.output()}\n${await collectVscodeLogs(state.userDataDir)}`;
       const matches = qualifyingLoadRecords(clientEvidence, state.packageRoot);
       const observed = matches > 0;
-      return loadOnlyOutput(observed ? "pass" : "unknown", observed ? "observed" : "not-observed", version, [
+      return loadOnlyOutput(observed ? "pass" : "unknown", observed ? "observed" : "not-observed", versionObservation.version, [
         evidence(
           "APCI-CLIENT-VSCODE-REGISTER-001",
           "vscode/local-registration",
@@ -244,7 +251,9 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
         evidence(
           "APCI-CLIENT-VSCODE-VERSION-001",
           "vscode/version",
-          "The target client version was obtained through a bounded direct executable invocation."
+          versionObservation.source === "bundled-cli"
+            ? "The target client version was obtained through VS Code's validated bundled CLI entrypoint using a bounded direct process invocation."
+            : "The target client version was obtained through a bounded direct executable invocation."
         ),
         observed
           ? evidence(
@@ -269,19 +278,56 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
     return this.#finalizePromise;
   }
 
-  async #readVersion(state: AdapterState, signal: AbortSignal): Promise<string | undefined> {
-    const launched = launchProcess(
-      this.#dependencies,
-      state.executablePath,
+  async #readVersion(state: AdapterState, signal: AbortSignal): Promise<VersionObservation | undefined> {
+    if (this.#dependencies.platform === "win32") {
+      const bundledCliPath = await resolveWindowsBundledCli(state.executablePath);
+      if (bundledCliPath) {
+        const bundledVersion = await this.#probeVersion(
+          state,
+          [bundledCliPath, "--user-data-dir", state.userDataDir, "--extensions-dir", state.extensionsDir, "--version"],
+          { ...state.environment, ELECTRON_RUN_AS_NODE: "1" },
+          signal,
+          true
+        );
+        if (bundledVersion) return { version: bundledVersion, source: "bundled-cli" };
+      }
+    }
+    const directVersion = await this.#probeVersion(
+      state,
       ["--user-data-dir", state.userDataDir, "--extensions-dir", state.extensionsDir, "--version"],
       state.environment,
-      state.tempRoot,
+      signal,
       false
     );
-    this.#active = launched;
-    await waitForExit(launched.exit, VERSION_TIMEOUT_MS, signal);
-    await this.#stopActive();
-    return parseVscodeVersion(launched.output());
+    return directVersion ? { version: directVersion, source: "direct-executable" } : undefined;
+  }
+
+  async #probeVersion(
+    state: AdapterState,
+    args: readonly string[],
+    environment: NodeJS.ProcessEnv,
+    signal: AbortSignal,
+    allowFallback: boolean
+  ): Promise<string | undefined> {
+    let launched: LaunchedProcess | undefined;
+    try {
+      launched = launchProcess(
+        this.#dependencies,
+        state.executablePath,
+        args,
+        environment,
+        state.tempRoot,
+        false
+      );
+      this.#active = launched;
+      await waitForExit(launched.exit, VERSION_TIMEOUT_MS, signal);
+      await this.#stopActive();
+      return parseVscodeVersion(launched.output());
+    } catch (error) {
+      if (launched && this.#active === launched) await this.#stopActive();
+      if (!allowFallback || signal.aborted) throw error;
+      return undefined;
+    }
   }
 
   async #stopActive(): Promise<void> {
@@ -331,6 +377,103 @@ async function validateExecutablePath(raw: string, platform: NodeJS.Platform): P
     throw new Error("VS Code executable path is not executable");
   }
   return await realpath(raw);
+}
+
+async function resolveWindowsBundledCli(executablePath: string): Promise<string | undefined> {
+  try {
+    if (basename(executablePath).toLowerCase() !== "code.exe") return undefined;
+    const installationRoot = dirname(executablePath);
+    const rootInfo = await lstat(installationRoot);
+    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) return undefined;
+    const canonicalRoot = await realpath(installationRoot);
+    if (resolve(canonicalRoot) !== resolve(installationRoot)) return undefined;
+
+    const launcherPath = await validateContainedRegularFile(canonicalRoot, ["bin", "code.cmd"]);
+    const launcher = await readBoundedTrustedFile(launcherPath, canonicalRoot, MAX_WINDOWS_LAUNCHER_BYTES);
+    const relativeCliPath = parseWindowsBundledCliLauncher(launcher);
+    if (!relativeCliPath) return undefined;
+    return await validateContainedRegularFile(
+      canonicalRoot,
+      relativeCliPath.split("\\"),
+      MAX_WINDOWS_BUNDLED_CLI_BYTES
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+function parseWindowsBundledCliLauncher(raw: string): string | undefined {
+  if (raw.includes("\u0000") || raw.includes("\r") && !raw.includes("\r\n")) return undefined;
+  const normalized = raw.replaceAll("\r\n", "\n");
+  if (normalized.includes("\r")) return undefined;
+  const match = /^@echo off\nsetlocal\nset VSCODE_DEV=\nset ELECTRON_RUN_AS_NODE=1\n"%~dp0\.\.\\Code\.exe" "%~dp0\.\.\\(?:(?<version>[0-9a-f]{10})\\)?resources\\app\\out\\cli\.js" %\*\nIF %ERRORLEVEL% NEQ 0 EXIT \/b %ERRORLEVEL%\nendlocal\n?$/.exec(normalized);
+  if (!match) return undefined;
+  const versionDirectory = match.groups?.version;
+  return versionDirectory
+    ? `${versionDirectory}\\resources\\app\\out\\cli.js`
+    : "resources\\app\\out\\cli.js";
+}
+
+async function validateContainedRegularFile(
+  root: string,
+  segments: readonly string[],
+  maximumFileBytes?: number
+): Promise<string> {
+  if (segments.length === 0 || segments.some((segment) => !segment || segment === "." || segment === ".."
+    || segment.includes("/") || segment.includes("\\") || /[\u0000-\u001f\u007f]/.test(segment))) {
+    throw new Error("VS Code bundled CLI path was not trusted");
+  }
+  let candidate = root;
+  for (let index = 0; index < segments.length; index += 1) {
+    candidate = join(candidate, segments[index]!);
+    if (!isWithin(root, candidate)) throw new Error("VS Code bundled CLI path escaped its installation root");
+    const info = await lstat(candidate);
+    const isLast = index === segments.length - 1;
+    if (info.isSymbolicLink() || (isLast ? !info.isFile() : !info.isDirectory())
+      || (isLast && maximumFileBytes !== undefined && info.size > maximumFileBytes)) {
+      throw new Error("VS Code bundled CLI path contained an unsafe filesystem entry");
+    }
+    const canonicalCandidate = await realpath(candidate);
+    if (!isWithin(root, canonicalCandidate)) {
+      throw new Error("VS Code bundled CLI path escaped its installation root");
+    }
+    candidate = canonicalCandidate;
+  }
+  return candidate;
+}
+
+async function readBoundedTrustedFile(path: string, root: string, maximumBytes: number): Promise<string> {
+  const before = await lstat(path);
+  if (!before.isFile() || before.isSymbolicLink() || before.size > maximumBytes) {
+    throw new Error("VS Code bundled CLI launcher was not a bounded regular file");
+  }
+  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+  const handle = await open(path, constants.O_RDONLY | noFollow);
+  try {
+    const opened = await handle.stat();
+    const canonicalPath = await realpath(path);
+    if (!opened.isFile() || opened.size > maximumBytes || !sameFileIdentity(before, opened)
+      || !isWithin(root, canonicalPath)) {
+      throw new Error("VS Code bundled CLI launcher changed during validation");
+    }
+    const buffer = Buffer.alloc(maximumBytes + 1);
+    let retained = 0;
+    while (retained < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, retained, buffer.length - retained, retained);
+      if (bytesRead === 0) break;
+      retained += bytesRead;
+    }
+    const after = await lstat(path);
+    const afterCanonical = await realpath(path);
+    if (retained > maximumBytes || retained !== opened.size || after.size !== opened.size
+      || !after.isFile() || after.isSymbolicLink() || !sameFileIdentity(opened, after)
+      || !isWithin(root, afterCanonical)) {
+      throw new Error("VS Code bundled CLI launcher changed during validation");
+    }
+    return buffer.subarray(0, retained).toString("utf8");
+  } finally {
+    await handle.close();
+  }
 }
 
 async function validatePackageRoot(raw: string): Promise<string> {
