@@ -32,7 +32,7 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
   it("declares the real target and all conservative opt-in capabilities", () => {
     const adapter = createVscodeClientRuntimeAdapter({ executablePath: process.execPath });
     expect(adapter.metadata).toEqual({
-      adapter: { id: "vscode-github-copilot", version: "1.4.0" },
+      adapter: { id: "vscode-github-copilot", version: "1.5.0" },
       targetClient: { id: "vscode-github-copilot", name: "VS Code/GitHub Copilot" },
       synthetic: false,
       requiredCapabilities: ["package-read", "client-process", "client-filesystem", "network"]
@@ -105,8 +105,11 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
       mcpHandshake: "observed",
       toolExposure: "observed",
       toolInvocation: "observed",
-      interoperability: "not-established"
+      interoperability: "scoped-established",
+      interoperabilityScope: "named-client-version-mcp-tool-path"
     });
+    expect(report.note).toContain("Package installation is a separate observation");
+    expect(report.note).toContain("No general or universal client interoperability is claimed");
     expect(report.evidence.map((item) => item.code)).toContain("APCI-CLIENT-VSCODE-MCP-OBSERVED-001");
     expect(report.evidence.map((item) => item.code)).toContain("APCI-CLIENT-VSCODE-TOOL-INVOKED-001");
     const settings = JSON.parse(await fake.settingsReads[0]!) as Record<string, unknown>;
@@ -160,6 +163,8 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
       expect(report.mcpHandshake).toBe("unknown");
       expect(report.toolExposure).toBe("unknown");
       expect(report.toolInvocation).toBe("unknown");
+      expect(report.interoperability).toBe("not-established");
+      expect(report.interoperabilityScope).toBe("none");
       expect(JSON.stringify(report)).not.toContain("secret-value");
     }
   });
@@ -215,6 +220,7 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
       expect(report.toolExposure).toBe("observed");
       expect(report.toolInvocation).toBe("not-observed");
       expect(report.interoperability).toBe("not-established");
+      expect(report.interoperabilityScope).toBe("none");
       expect(report.evidence).toContainEqual(expect.objectContaining({
         code: "APCI-CLIENT-VSCODE-TOOL-INVOKED-002",
         summary: fixtureCase.summary
@@ -255,6 +261,8 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
       expect(report.execution).toEqual({ status: "fail", complete: false, finalize: "complete" });
       expect(report.toolExposure).toBe("unknown");
       expect(report.toolInvocation).toBe("unknown");
+      expect(report.interoperability).toBe("not-established");
+      expect(report.interoperabilityScope).toBe("none");
       expect(JSON.stringify(report)).not.toContain(secret);
       expect(JSON.stringify(report)).not.toContain("rawResult");
       expect(JSON.stringify(report)).not.toContain("ambiguous_second_tool");
@@ -281,6 +289,7 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
     expect(report.toolInvocation).toBe("unknown");
     expect(report.evidence.map((item) => item.code)).toContain("APCI-CLIENT-VSCODE-TOOL-INVOKED-003");
     expect(report.interoperability).toBe("not-established");
+    expect(report.interoperabilityScope).toBe("none");
   });
 
   it("uses the validated bundled Windows CLI for version and a strictly derived shadow executable for GUI loading", async () => {
@@ -328,7 +337,7 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
     });
 
     expect(report).toMatchObject({
-      adapter: { version: "1.4.0" },
+      adapter: { version: "1.5.0" },
       targetClient: { version: "1.118.0" },
       execution: { status: "pass", complete: true, finalize: "complete" },
       packageInstall: "not-observed",
@@ -337,7 +346,8 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
       mcpHandshake: "not-assessed",
       toolExposure: "not-assessed",
       toolInvocation: "not-assessed",
-      interoperability: "not-established"
+      interoperability: "not-established",
+      interoperabilityScope: "none"
     });
     const installedExecutableInvocations = fake.invocations.filter(
       (item) => item.executable === installation.executablePath
@@ -813,7 +823,8 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
       execution: { status: "unknown", complete: true, finalize: "complete" },
       packageInstall: "not-observed",
       clientLoad: "not-observed",
-      interoperability: "not-established"
+      interoperability: "not-established",
+      interoperabilityScope: "none"
     });
     expect(JSON.stringify(report)).toContain("APCI-CLIENT-VSCODE-LOAD-002");
     expect(JSON.stringify(report)).not.toContain("do-not-retain-this-secret");
@@ -1028,7 +1039,8 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
       mcpHandshake: "unknown",
       toolExposure: "unknown",
       toolInvocation: "unknown",
-      interoperability: "not-established"
+      interoperability: "not-established",
+      interoperabilityScope: "none"
     });
     expect(unavailableVersion.invocations.some((item) => item.args.includes("--wait"))).toBe(false);
     expect(JSON.stringify(versionReport)).not.toContain("raw-version-secret-value");
@@ -1052,6 +1064,7 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
     expect(clientReport.toolExposure).toBe("unknown");
     expect(clientReport.toolInvocation).toBe("unknown");
     expect(clientReport.interoperability).toBe("not-established");
+    expect(clientReport.interoperabilityScope).toBe("none");
   });
 
   it("denies missing capabilities before validation or process execution", async () => {

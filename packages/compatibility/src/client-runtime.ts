@@ -1,4 +1,4 @@
-export const CLIENT_RUNTIME_REPORT_SCHEMA_VERSION = "1.2.0";
+export const CLIENT_RUNTIME_REPORT_SCHEMA_VERSION = "1.3.0";
 export const CLIENT_RUNTIME_EVIDENCE_LEVEL = "client-runtime-observation" as const;
 export const CLIENT_RUNTIME_SCOPE = "client-adapter-harness" as const;
 
@@ -40,7 +40,8 @@ export type ClientRuntimeCapability = typeof CLIENT_RUNTIME_CAPABILITIES[number]
 export type ClientRuntimeObservationStatus = "observed" | "not-observed" | "not-assessed" | "unknown";
 export type ClientRuntimeExecutionStatus = "pass" | "fail" | "unknown" | "timeout" | "denied";
 export type ClientRuntimeFinalizeStatus = "complete" | "failed" | "timeout" | "not-run";
-export type ClientRuntimeInteroperability = "established" | "not-established";
+export type ClientRuntimeInteroperability = "scoped-established" | "not-established";
+export type ClientRuntimeInteroperabilityScope = "named-client-version-mcp-tool-path" | "none";
 
 export interface ClientRuntimeEvidence {
   code: string;
@@ -128,6 +129,7 @@ export interface ClientRuntimeReport {
   toolExposure: ClientRuntimeObservationStatus;
   toolInvocation: ClientRuntimeObservationStatus;
   interoperability: ClientRuntimeInteroperability;
+  interoperabilityScope: ClientRuntimeInteroperabilityScope;
   evidence: ClientRuntimeEvidence[];
   note: string;
 }
@@ -267,8 +269,8 @@ export async function runClientRuntimeHarness(
       : "Client adapter finalization failed; no exception details were retained."
   )];
   const complete = Boolean(normalized?.complete) && finalize === "complete";
-  const interoperability = warrantsInteroperability(metadata, normalized, complete)
-    ? "established" as const
+  const interoperability = warrantsScopedInteroperability(metadata, normalized, complete)
+    ? "scoped-established" as const
     : "not-established" as const;
 
   return baseReport(
@@ -334,7 +336,7 @@ function normalizeAdapterOutput(raw: unknown): ClientRuntimeAdapterOutput {
     if (!isObservation(raw.packageInstall) || !isObservation(raw.clientLoad)
       || !isObservation(raw.mcpStartup) || !isObservation(raw.mcpHandshake)
       || !isObservation(raw.toolExposure) || !isObservation(raw.toolInvocation)) throw new Error();
-    if (raw.interoperability !== "established" && raw.interoperability !== "not-established") throw new Error();
+    if (raw.interoperability !== "scoped-established" && raw.interoperability !== "not-established") throw new Error();
     if (raw.targetClientVersion !== undefined && !safeVersion(raw.targetClientVersion)) throw new Error();
     if (!Array.isArray(raw.evidence) || raw.evidence.length > MAX_EVIDENCE_INPUT_ITEMS) throw new Error();
     const items = raw.evidence.map(normalizeEvidence);
@@ -363,17 +365,21 @@ function normalizeEvidence(raw: unknown): ClientRuntimeEvidence {
   return evidence(raw.code, raw.location, raw.summary, raw.remediation);
 }
 
-function warrantsInteroperability(
+function warrantsScopedInteroperability(
   metadata: ClientRuntimeAdapterMetadata,
   output: ClientRuntimeAdapterOutput | undefined,
   complete: boolean
 ): boolean {
   return metadata.synthetic === false
-    && output?.interoperability === "established"
+    && output?.interoperability === "scoped-established"
     && output.status === "pass"
     && complete
-    && output.packageInstall === "observed"
+    && output.targetClientVersion !== undefined
     && output.clientLoad === "observed"
+    && output.mcpStartup === "observed"
+    && output.mcpHandshake === "observed"
+    && output.toolExposure === "observed"
+    && output.toolInvocation === "observed"
     && output.evidence.length > 0;
 }
 
@@ -428,11 +434,14 @@ function baseReport(
     toolExposure,
     toolInvocation,
     interoperability,
+    interoperabilityScope: interoperability === "scoped-established"
+      ? "named-client-version-mcp-tool-path"
+      : "none",
     evidence: boundedEvidence(items),
     note: metadata.synthetic
       ? "Synthetic fixture evidence exercises only the harness contract. It does not establish interoperability with any real client."
-      : interoperability === "established"
-        ? "Interoperability is established only for the named client version and bounded observations in this report."
+      : interoperability === "scoped-established"
+        ? "Scoped interoperability is established only for the named client version and observed MCP/tool path in this report. Package installation is a separate observation and is not established by this verdict. No general or universal client interoperability is claimed."
         : "Client runtime execution did not establish interoperability."
   };
 }

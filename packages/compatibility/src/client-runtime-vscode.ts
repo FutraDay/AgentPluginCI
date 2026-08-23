@@ -35,7 +35,7 @@ export const VSCODE_CLIENT_RUNTIME_REQUIRED_CAPABILITIES = Object.freeze([
   "network"
 ] as const);
 
-const ADAPTER_VERSION = "1.4.0";
+const ADAPTER_VERSION = "1.5.0";
 const MIN_OBSERVATION_MS = 100;
 const MAX_OBSERVATION_MS = 20_000;
 const DEFAULT_OBSERVATION_MS = 7_500;
@@ -1886,6 +1886,11 @@ function clientMcpOutput(
   evidenceItems: ClientRuntimeAdapterOutput["evidence"],
   complete: boolean
 ): ClientRuntimeAdapterOutput {
+  const scopedInteroperabilityEstablished = status === "pass"
+    && complete
+    && clientLoad === "observed"
+    && mcpObservation === "observed"
+    && toolInvocation === "observed";
   return {
     status,
     complete,
@@ -1895,7 +1900,7 @@ function clientMcpOutput(
     mcpHandshake: mcpObservation,
     toolExposure: mcpObservation,
     toolInvocation,
-    interoperability: "not-established",
+    interoperability: scopedInteroperabilityEstablished ? "scoped-established" : "not-established",
     targetClientVersion,
     evidence: evidenceItems
   };

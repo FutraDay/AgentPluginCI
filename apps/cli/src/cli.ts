@@ -978,7 +978,7 @@ function renderClientRuntimeCompatibility(
 ): void {
   const write = payload.ok ? stdout : stderr;
   write(`CLIENT_RUNTIME_${payload.execution.status.toUpperCase().replace("-", "_")} ${sanitizeConsoleText(payload.target)}`);
-  write(`CLIENT_RUNTIME_SCOPE ${payload.scope} complete=${payload.execution.complete} synthetic=${payload.synthetic} interoperability=${payload.interoperability}`);
+  write(`CLIENT_RUNTIME_SCOPE ${payload.scope} complete=${payload.execution.complete} synthetic=${payload.synthetic} interoperability=${payload.interoperability} interoperability-scope=${payload.interoperabilityScope}`);
   write(`CLIENT_ADAPTER ${payload.adapter.id}@${payload.adapter.version}`);
   write(`TARGET_CLIENT ${payload.targetClient.id}${payload.targetClient.version ? `@${payload.targetClient.version}` : "@unknown"}`);
   write(`CLIENT_OBSERVATIONS install=${payload.packageInstall} load=${payload.clientLoad} mcp-startup=${payload.mcpStartup} mcp-handshake=${payload.mcpHandshake} tool-exposure=${payload.toolExposure} tool-invocation=${payload.toolInvocation} finalize=${payload.execution.finalize}`);

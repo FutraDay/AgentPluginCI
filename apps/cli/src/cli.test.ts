@@ -472,14 +472,17 @@ describe("Agent Plugin CI CLI", () => {
       execution: { status: "pass", complete: true, finalize: "complete" },
       packageInstall: "observed",
       clientLoad: "observed",
-      interoperability: "not-established"
+      interoperability: "not-established",
+      interoperabilityScope: "none"
     });
     expect(jsonCap.stdout[0]).toContain("does not establish interoperability with any real client");
 
     const textCap = capture();
     expect(await runCli(fixtureArgs, { cwd, ...textCap.io })).toBe(0);
     expect(textCap.stdout.some((line) => line.startsWith("CLIENT_RUNTIME_PASS"))).toBe(true);
-    expect(textCap.stdout).toContain("CLIENT_RUNTIME_SCOPE client-adapter-harness complete=true synthetic=true interoperability=not-established");
+    expect(textCap.stdout).toContain(
+      "CLIENT_RUNTIME_SCOPE client-adapter-harness complete=true synthetic=true interoperability=not-established interoperability-scope=none"
+    );
     expect(textCap.stdout).toContain(
       "CLIENT_OBSERVATIONS install=observed load=observed mcp-startup=not-assessed mcp-handshake=not-assessed tool-exposure=not-assessed tool-invocation=not-assessed finalize=complete"
     );
@@ -575,7 +578,8 @@ describe("Agent Plugin CI CLI", () => {
       mcpHandshake: "not-assessed",
       toolExposure: "not-assessed",
       toolInvocation: "not-assessed",
-      interoperability: "not-established"
+      interoperability: "not-established",
+      interoperabilityScope: "none"
     });
   });
 

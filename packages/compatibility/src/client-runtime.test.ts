@@ -145,7 +145,7 @@ describe("client runtime harness", () => {
     const second = await runClientRuntimeHarness("package", createSyntheticFixtureClientAdapter(), { allowExecution: true });
     expect(events).toEqual(["initialize", "execute", "finalize:pass"]);
     expect(first).toMatchObject({
-      schemaVersion: "1.2.0",
+      schemaVersion: "1.3.0",
       evidenceLevel: "client-runtime-observation",
       scope: "client-adapter-harness",
       synthetic: true,
@@ -158,7 +158,8 @@ describe("client runtime harness", () => {
       mcpHandshake: "not-assessed",
       toolExposure: "not-assessed",
       toolInvocation: "not-assessed",
-      interoperability: "not-established"
+      interoperability: "not-established",
+      interoperabilityScope: "none"
     });
     expect(first.note).toContain("does not establish interoperability with any real client");
     expect(JSON.stringify(first)).toBe(JSON.stringify(second));
@@ -180,7 +181,8 @@ describe("client runtime harness", () => {
       mcpHandshake: "unknown",
       toolExposure: "unknown",
       toolInvocation: "unknown",
-      interoperability: "not-established"
+      interoperability: "not-established",
+      interoperabilityScope: "none"
     });
     expect(JSON.stringify(report)).toContain("APCI-CLIENT-LIFECYCLE-002");
   });
@@ -209,7 +211,7 @@ describe("client runtime harness", () => {
     expect(unsafe.evidence.every((item) => item.location.length <= 240 && item.summary.length <= 240)).toBe(true);
 
     const unsortedAdapter = adapter("order-adapter", {
-      execute: () => output([
+      execute: () => output({}, [
         { code: "APCI-CLIENT-TEST-002", location: "z", summary: "second" },
         { code: "APCI-CLIENT-TEST-001", location: "a", summary: "first" }
       ])
@@ -218,7 +220,7 @@ describe("client runtime harness", () => {
     expect(report.evidence.map((item) => item.code)).toEqual(["APCI-CLIENT-TEST-001", "APCI-CLIENT-TEST-002"]);
 
     const manyEvidence = adapter("bounded-adapter", {
-      execute: () => output(Array.from({ length: 12 }, (_, index) => ({
+      execute: () => output({}, Array.from({ length: 12 }, (_, index) => ({
         code: `APCI-CLIENT-BOUND-${String(index).padStart(3, "0")}`,
         location: "test",
         summary: `item ${index}`
@@ -240,12 +242,13 @@ describe("client runtime harness", () => {
       mcpHandshake: "unknown",
       toolExposure: "unknown",
       toolInvocation: "unknown",
-      interoperability: "not-established"
+      interoperability: "not-established",
+      interoperabilityScope: "none"
     });
     expect(JSON.stringify(report)).toContain("APCI-CLIENT-OUTPUT-001");
 
     const unsafeEvidence = adapter("unsafe-output-adapter", {
-      execute: () => output([{ code: "bad\ncode", location: "test", summary: "unsafe" }])
+      execute: () => output({}, [{ code: "bad\ncode", location: "test", summary: "unsafe" }])
     });
     const unsafeReport = await runClientRuntimeHarness("package", unsafeEvidence, { allowExecution: true });
     expect(unsafeReport.execution.status).toBe("unknown");
@@ -271,15 +274,108 @@ describe("client runtime harness", () => {
     expect(JSON.stringify(legacyReport)).toContain("APCI-CLIENT-OUTPUT-001");
   });
 
-  it("does not accept synthetic or incomplete interoperability claims", async () => {
+  it("establishes only named-client-version MCP/tool interoperability without requiring package installation", async () => {
+    const real = adapter("scoped-real-adapter", {
+      synthetic: false,
+      execute: () => output({ packageInstall: "not-observed" })
+    });
+    const report = await runClientRuntimeHarness("package", real, { allowExecution: true });
+
+    expect(report).toMatchObject({
+      execution: { status: "pass", complete: true, finalize: "complete" },
+      targetClient: { version: "1.0.0" },
+      packageInstall: "not-observed",
+      clientLoad: "observed",
+      mcpStartup: "observed",
+      mcpHandshake: "observed",
+      toolExposure: "observed",
+      toolInvocation: "observed",
+      interoperability: "scoped-established",
+      interoperabilityScope: "named-client-version-mcp-tool-path"
+    });
+    expect(report.note).toContain("named client version");
+    expect(report.note).toContain("observed MCP/tool path");
+    expect(report.note).toContain("Package installation is a separate observation");
+    expect(report.note).toContain("No general or universal client interoperability is claimed");
+  });
+
+  it.each([
+    "clientLoad",
+    "mcpStartup",
+    "mcpHandshake",
+    "toolExposure",
+    "toolInvocation"
+  ] as const)("requires %s to be observed for scoped interoperability", async (field) => {
+    const real = adapter(`missing-${field.toLowerCase()}`, {
+      synthetic: false,
+      execute: () => output({ [field]: "not-observed" })
+    });
+    const report = await runClientRuntimeHarness("package", real, { allowExecution: true });
+
+    expect(report.interoperability).toBe("not-established");
+    expect(report.interoperabilityScope).toBe("none");
+  });
+
+  it("requires an exact bounded adapter-observed client version for scoped interoperability", async () => {
+    const real = adapter("missing-output-version", {
+      synthetic: false,
+      execute: () => output({ targetClientVersion: undefined })
+    });
+    const report = await runClientRuntimeHarness("package", real, { allowExecution: true });
+
+    expect(report.targetClient.version).toBe("1.0.0");
+    expect(report.interoperability).toBe("not-established");
+    expect(report.interoperabilityScope).toBe("none");
+  });
+
+  it.each([
+    ["adapter claim", { interoperability: "not-established" as const }, undefined],
+    ["passing execution status", { status: "fail" as const }, undefined],
+    ["bounded evidence", {}, []]
+  ])("requires a positive %s for scoped interoperability", async (_criterion, overrides, evidenceItems) => {
+    const real = adapter(`missing-${_criterion.replaceAll(" ", "-")}`, {
+      synthetic: false,
+      execute: () => output(overrides, evidenceItems)
+    });
+    const report = await runClientRuntimeHarness("package", real, { allowExecution: true });
+
+    expect(report.interoperability).toBe("not-established");
+    expect(report.interoperabilityScope).toBe("none");
+  });
+
+  it("rejects the legacy generic established adapter claim", async () => {
+    const legacyClaim = adapter("legacy-established-claim", {
+      synthetic: false,
+      execute: () => ({ ...output(), interoperability: "established" })
+    });
+    const report = await runClientRuntimeHarness("package", legacyClaim, { allowExecution: true });
+
+    expect(report.execution).toEqual({ status: "unknown", complete: false, finalize: "complete" });
+    expect(report.interoperability).toBe("not-established");
+    expect(report.interoperabilityScope).toBe("none");
+    expect(report.evidence).toContainEqual(expect.objectContaining({ code: "APCI-CLIENT-OUTPUT-001" }));
+  });
+
+  it("does not accept synthetic, incomplete, or finalization-failed scoped interoperability claims", async () => {
     const synthetic = await runClientRuntimeHarness("package", createSyntheticFixtureClientAdapter(), { allowExecution: true });
     expect(synthetic.interoperability).toBe("not-established");
+    expect(synthetic.interoperabilityScope).toBe("none");
     const incomplete = adapter("future-incomplete-adapter", {
       synthetic: false,
       execute: () => ({ ...output(), complete: false })
     });
-    expect((await runClientRuntimeHarness("package", incomplete, { allowExecution: true })).interoperability)
-      .toBe("not-established");
+    const incompleteReport = await runClientRuntimeHarness("package", incomplete, { allowExecution: true });
+    expect(incompleteReport.interoperability).toBe("not-established");
+    expect(incompleteReport.interoperabilityScope).toBe("none");
+
+    const finalizationFailed = adapter("finalization-failed-adapter", {
+      synthetic: false,
+      finalize: () => { throw new Error("cleanup failed"); }
+    });
+    const finalizationReport = await runClientRuntimeHarness("package", finalizationFailed, { allowExecution: true });
+    expect(finalizationReport.execution).toEqual({ status: "pass", complete: false, finalize: "failed" });
+    expect(finalizationReport.interoperability).toBe("not-established");
+    expect(finalizationReport.interoperabilityScope).toBe("none");
   });
 });
 
@@ -304,17 +400,33 @@ function adapter(
   };
 }
 
-function output(evidence = [{ code: "APCI-CLIENT-TEST-001", location: "test", summary: "bounded evidence" }]) {
+function output(
+  overrides: Partial<{
+    status: "pass" | "fail" | "unknown";
+    complete: boolean;
+    packageInstall: "observed" | "not-observed" | "not-assessed" | "unknown";
+    clientLoad: "observed" | "not-observed" | "not-assessed" | "unknown";
+    mcpStartup: "observed" | "not-observed" | "not-assessed" | "unknown";
+    mcpHandshake: "observed" | "not-observed" | "not-assessed" | "unknown";
+    toolExposure: "observed" | "not-observed" | "not-assessed" | "unknown";
+    toolInvocation: "observed" | "not-observed" | "not-assessed" | "unknown";
+    interoperability: "scoped-established" | "not-established";
+    targetClientVersion: string | undefined;
+  }> = {},
+  evidence = [{ code: "APCI-CLIENT-TEST-001", location: "test", summary: "bounded evidence" }]
+) {
   return {
     status: "pass",
     complete: true,
     packageInstall: "observed",
     clientLoad: "observed",
-    mcpStartup: "not-assessed",
-    mcpHandshake: "not-assessed",
-    toolExposure: "not-assessed",
-    toolInvocation: "not-assessed",
-    interoperability: "established",
+    mcpStartup: "observed",
+    mcpHandshake: "observed",
+    toolExposure: "observed",
+    toolInvocation: "observed",
+    interoperability: "scoped-established",
+    targetClientVersion: "1.0.0",
+    ...overrides,
     evidence
   } as const;
 }
