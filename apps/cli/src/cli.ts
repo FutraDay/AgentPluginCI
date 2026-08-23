@@ -2,11 +2,14 @@ import { lstat, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   assessPackageCompatibility,
+  assessPackageRuntimeCompatibility,
   assessPluginCompatibility,
   BUILT_IN_COMPATIBILITY_PROFILES,
   PORTABLE_CORE_PROFILE_ID,
   UnknownCompatibilityProfileError,
-  type CompatibilitySuiteReport
+  type CompatibilitySuiteReport,
+  type RuntimeCompatibilityOptions,
+  type RuntimeCompatibilityReport
 } from "@agent-plugin-ci/compatibility";
 import {
   certifyPluginEvidence,
@@ -80,6 +83,7 @@ export async function runCli(rawArgs: string[], io: CliIo = {}): Promise<number>
     if (args[0] === "validate") return await runValidate(args.slice(1), cwd, stdout, stderr);
     if (args[0] === "scan") return await runScan(args.slice(1), cwd, stdout, stderr);
     if (args[0] === "compat") return await runCompat(args.slice(1), cwd, stdout, stderr);
+    if (args[0] === "compat-runtime") return await runCompatRuntime(args.slice(1), cwd, stdout, stderr);
     if (args[0] === "certify") return await runCertify(args.slice(1), cwd, stdout, stderr);
     throw new CliError(`Unknown command: ${args[0]}`, "USAGE_ERROR", 2);
   } catch (error) {
@@ -266,6 +270,28 @@ async function runCompat(
   return ok ? 0 : 1;
 }
 
+async function runCompatRuntime(
+  args: string[],
+  cwd: string,
+  stdout: (message: string) => void,
+  stderr: (message: string) => void
+): Promise<number> {
+  const { target, json, options } = parseCompatRuntimeArgs(args);
+  const resolved = resolve(cwd, target);
+  const info = await lstat(resolved).catch(() => undefined);
+  if (!info) throw new CliError(`Runtime compatibility target not found: ${target}`, "RUNTIME_COMPATIBILITY_INPUT_ERROR");
+  if (info.isSymbolicLink() || (!info.isDirectory() && (!info.isFile() || basename(resolved) !== "plugin.json"))) {
+    throw new CliError("Runtime compatibility target must be a regular package directory or its regular plugin.json file", "RUNTIME_COMPATIBILITY_INPUT_ERROR");
+  }
+  const packageDir = info.isDirectory() ? resolved : dirname(resolved);
+  const report = await assessPackageRuntimeCompatibility(packageDir, options);
+  const ok = report.status === "pass" && report.complete && report.servers.length > 0;
+  const payload = { ok, command: "compat-runtime", version: CLI_VERSION, target: packageDir, ...report };
+  if (json) stdout(JSON.stringify(payload));
+  else renderRuntimeCompatibility(payload, stdout, stderr);
+  return ok ? 0 : 1;
+}
+
 async function runCertify(
   args: string[],
   cwd: string,
@@ -429,6 +455,34 @@ function parseCompatArgs(args: string[]): { target: string; json: boolean; profi
   return { target, json, profileIds };
 }
 
+function parseCompatRuntimeArgs(args: string[]): { target: string; json: boolean; options: RuntimeCompatibilityOptions } {
+  let target = ".";
+  let seenTarget = false;
+  let json = false;
+  let timeoutMs: number | undefined;
+  const options: RuntimeCompatibilityOptions = {};
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (arg === "--json") { json = true; continue; }
+    if (arg === "--allow-stdio-runtime") { options.allowStdioRuntime = true; continue; }
+    if (arg === "--allow-private-network") { options.allowPrivateNetwork = true; continue; }
+    if (arg === "--allow-insecure-http") { options.allowInsecureHttp = true; continue; }
+    if (arg === "--timeout-ms") {
+      const value = args[++index];
+      if (!value || !/^\d+$/.test(value)) throw new CliError("--timeout-ms requires an integer from 100 to 30000", "USAGE_ERROR", 2);
+      timeoutMs = Number(value);
+      if (timeoutMs < 100 || timeoutMs > 30_000) throw new CliError("--timeout-ms requires an integer from 100 to 30000", "USAGE_ERROR", 2);
+      continue;
+    }
+    if (arg.startsWith("--")) throw new CliError(`Unknown compat-runtime option: ${arg}`, "USAGE_ERROR", 2);
+    if (seenTarget) throw new CliError("compat-runtime accepts only one target", "USAGE_ERROR", 2);
+    target = arg;
+    seenTarget = true;
+  }
+  if (timeoutMs !== undefined) options.timeoutMs = timeoutMs;
+  return { target, json, options };
+}
+
 function parseCertifyArgs(args: string[]): { target: string; json: boolean } {
   let target = ".";
   let seenTarget = false;
@@ -464,7 +518,7 @@ function validateSourceSpecificFlags(sourceKind: SourceKind, flags: Set<string>)
 }
 
 function normalizeLegacyArgs(args: string[]): string[] {
-  if (["build", "validate", "scan", "compat", "certify"].includes(args[0]!)) return args;
+  if (["build", "validate", "scan", "compat", "compat-runtime", "certify"].includes(args[0]!)) return args;
   if (args[0]?.startsWith("--")) return ["build", ...args];
   if (args[0]) {
     const [input, maybeOut, ...rest] = args;
@@ -746,6 +800,24 @@ function renderCompatibility(
   write(`NOTE ${sanitizeConsoleText(payload.runtimeEvidence.note)}`);
 }
 
+function renderRuntimeCompatibility(
+  payload: RuntimeCompatibilityReport & { ok: boolean; target: string },
+  stdout: (message: string) => void,
+  stderr: (message: string) => void
+): void {
+  const write = payload.ok ? stdout : stderr;
+  write(`RUNTIME_COMPATIBILITY_${payload.status.toUpperCase().replace("-", "_")} ${sanitizeConsoleText(payload.target)}`);
+  write(`RUNTIME_SCOPE ${payload.scope} complete=${payload.complete} interoperability=${payload.interoperability}`);
+  write(`RUNTIME_CLIENT install=${payload.clientInstall} load=${payload.clientLoad} mcp-handshake=${payload.mcpHandshake}`);
+  write(`RUNTIME_SUMMARY pass=${payload.summary.pass} fail=${payload.summary.fail} unknown=${payload.summary.unknown} not-assessed=${payload.summary.notAssessed}`);
+  for (const server of payload.servers) {
+    write(`SERVER ${sanitizeConsoleText(server.name)} transport=${server.transport} status=${server.status} startup=${server.startup} handshake=${server.handshake} complete=${server.complete}`);
+    for (const item of server.evidence) write(`  [${item.code}] ${sanitizeConsoleText(item.summary)}`);
+  }
+  for (const item of payload.evidence) write(`[${item.code}] ${sanitizeConsoleText(item.summary)}`);
+  write(`NOTE ${sanitizeConsoleText(payload.note)}`);
+}
+
 function renderCertification(
   payload: CertificationReport & { ok: boolean; target: string },
   stdout: (message: string) => void,
@@ -823,6 +895,7 @@ Usage:
   agentplugin validate [package-dir|plugin.json] [--json]
   agentplugin scan [package-dir|plugin.json] [--fail-on <severity>] [--json]
   agentplugin compat [package-dir|plugin.json] [--profile <id>|--all] [--json]
+  agentplugin compat-runtime [package-dir|plugin.json] [options]
   agentplugin certify [package-dir|plugin.json] [--json]
   agentplugin --version
 
@@ -853,6 +926,13 @@ Compatibility options:
   --profile <id>                  Run one versioned profile (default: ${PORTABLE_CORE_PROFILE_ID})
   --all                           Run every built-in static compatibility profile
   --json                          Emit deterministic static evidence and summaries as JSON
+
+Runtime compatibility options:
+  --allow-stdio-runtime           Explicitly permit stdio MCP process execution for this runtime assessment
+  --allow-private-network         Permit private-network remote MCP runtime targets
+  --allow-insecure-http           Permit insecure HTTP remote MCP runtime targets
+  --timeout-ms <100-30000>        Per-server MCP initialize timeout (default: 5000)
+  --json                          Emit bounded runtime startup/handshake evidence as JSON
 
 Certification:
   Aggregates official validation, fail-on-high security, and the three pinned Phase 2J

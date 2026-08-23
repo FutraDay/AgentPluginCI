@@ -425,4 +425,77 @@ describe("Agent Plugin CI CLI", () => {
     expect(cap.stdout[0]).not.toContain("Unexpected token");
   });
 
+  it("runs explicit MCP runtime compatibility with stdio opt-in", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-runtime-cli-"));
+    await writeFile(join(cwd, "plugin.json"), JSON.stringify({
+      $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", name: "runtime-cli"
+    }), "utf8");
+    await writeFile(join(cwd, "mcp.json"), JSON.stringify({
+      $schema: "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+      mcpServers: { fixture: { type: "stdio", command: "node", args: [join(repoRoot, "packages/ingest-mcp/test-fixtures/stdio-server.mjs")] } }
+    }), "utf8");
+
+    const jsonCap = capture();
+    expect(await runCli(["compat-runtime", cwd, "--allow-stdio-runtime", "--timeout-ms", "5000", "--json"], { cwd, ...jsonCap.io })).toBe(0);
+    expect(JSON.parse(jsonCap.stdout[0]!)).toMatchObject({
+      ok: true, command: "compat-runtime", status: "pass", complete: true,
+      interoperability: "not-established", clientInstall: "not-assessed", clientLoad: "not-assessed", mcpHandshake: "verified"
+    });
+
+    const textCap = capture();
+    expect(await runCli(["compat-runtime", cwd, "--allow-stdio-runtime"], { cwd, ...textCap.io })).toBe(0);
+    expect(textCap.stdout.some((line) => line.startsWith("RUNTIME_COMPATIBILITY_PASS"))).toBe(true);
+    expect(textCap.stdout).toContain("RUNTIME_CLIENT install=not-assessed load=not-assessed mcp-handshake=verified");
+  }, 15_000);
+
+  it("denies stdio runtime execution by default", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-runtime-denied-cli-"));
+    const markerPath = join(cwd, "executed.txt");
+    await writeFile(join(cwd, "marker.mjs"), `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(markerPath)}, 'ran');`, "utf8");
+    await writeFile(join(cwd, "plugin.json"), JSON.stringify({
+      $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", name: "runtime-denied"
+    }), "utf8");
+    await writeFile(join(cwd, "mcp.json"), JSON.stringify({
+      $schema: "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+      mcpServers: { local: { type: "stdio", command: "node", args: ["marker.mjs"] } }
+    }), "utf8");
+    const cap = capture();
+    expect(await runCli(["compat-runtime", cwd, "--json"], { cwd, ...cap.io })).toBe(1);
+    expect(JSON.parse(cap.stdout[0]!)).toMatchObject({ ok: false, status: "not-assessed", mcpHandshake: "not-assessed" });
+    expect(await stat(markerPath).catch(() => undefined)).toBeUndefined();
+  });
+
+  it("keeps static compat and certification non-executing", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-static-noexec-"));
+    const markerPath = join(cwd, "static-executed.txt");
+    await writeFile(join(cwd, "marker.mjs"), `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(markerPath)}, 'ran');`, "utf8");
+    await writeFile(join(cwd, "plugin.json"), JSON.stringify({
+      $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", name: "static-noexec"
+    }), "utf8");
+    await writeFile(join(cwd, "mcp.json"), JSON.stringify({
+      $schema: "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+      mcpServers: { local: { type: "stdio", command: "node", args: ["marker.mjs"] } }
+    }), "utf8");
+    expect(await runCli(["compat", cwd, "--all", "--json"], { cwd, ...capture().io })).toBe(0);
+    expect(await runCli(["certify", cwd, "--json"], { cwd, ...capture().io })).toBe(0);
+    expect(await stat(markerPath).catch(() => undefined)).toBeUndefined();
+  });
+
+  it("does not treat a no-MCP package as runtime verified", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-runtime-none-cli-"));
+    await writeFile(join(cwd, "plugin.json"), JSON.stringify({
+      $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", name: "runtime-none"
+    }), "utf8");
+    const cap = capture();
+    expect(await runCli(["compat-runtime", cwd, "--json"], { cwd, ...cap.io })).toBe(1);
+    expect(JSON.parse(cap.stdout[0]!)).toMatchObject({
+      ok: false, status: "not-assessed", complete: false, interoperability: "not-established", mcpHandshake: "not-assessed"
+    });
+  });
+
+  it("rejects invalid runtime compatibility options with usage exit code", async () => {
+    const cap = capture();
+    expect(await runCli(["compat-runtime", ".", "--timeout-ms", "99", "--json"], cap.io)).toBe(2);
+    expect(JSON.parse(cap.stdout[0]!)).toMatchObject({ error: { code: "USAGE_ERROR" }, exitCode: 2 });
+  });
 });

@@ -71,6 +71,9 @@ importers:
       '@agent-plugin-ci/validator':
         specifier: workspace:*
         version: link:../validator
+      '@modelcontextprotocol/client':
+        specifier: 2.0.0
+        version: 2.0.0
 
   packages/compiler:
     dependencies:

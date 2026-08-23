@@ -70,6 +70,21 @@ jobs:
           ./node_modules/.bin/agentplugin scan out --json
           ./node_modules/.bin/agentplugin compat out --all --json
           ./node_modules/.bin/agentplugin certify out --json
+          mkdir runtime-package
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const root = 'runtime-package';
+          fs.writeFileSync(path.join(root, 'plugin.json'), JSON.stringify({
+            $schema: 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json',
+            name: 'packaged-runtime-smoke'
+          }));
+          fs.writeFileSync(path.join(root, 'mcp.json'), JSON.stringify({
+            $schema: 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json',
+            mcpServers: { fixture: { type: 'stdio', command: 'node', args: [path.join(process.env.GITHUB_WORKSPACE, 'packages/ingest-mcp/test-fixtures/stdio-server.mjs')] } }
+          }));
+          NODE
+          ./node_modules/.bin/agentplugin compat-runtime runtime-package --allow-stdio-runtime --timeout-ms 5000 --json
       - run: git diff --check
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
