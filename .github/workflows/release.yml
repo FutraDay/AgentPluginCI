@@ -5,39 +5,193 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   package:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    outputs:
+      artifact: ${{ steps.release.outputs.artifact }}
+      tarball: ${{ steps.release.outputs.tarball }}
+      version: ${{ steps.release.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
         with:
           version: 11.2.2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22.13
+          node-version: 22.14.0
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - name: Verify tag matches CLI version
-        run: node -e "const p=require('./apps/cli/package.json'); if ('v'+p.version !== process.env.GITHUB_REF_NAME) { console.error('Tag/version mismatch'); process.exit(1) }"
-      - run: pnpm verify
-      - run: pnpm pack:cli
+      - name: Verify tag and release package identity
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: >-
+          node --input-type=module -e
+          'import { appendFileSync, readFileSync } from "node:fs";
+          const p = JSON.parse(readFileSync("apps/cli/package.json", "utf8"));
+          const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+          if (p.name !== "@agent-plugin-ci/cli" || !semver.test(p.version) || `v${p.version}` !== process.env.RELEASE_TAG) {
+            console.error("Tag/package name/version mismatch"); process.exit(1);
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT,
+            `version=${p.version}\ntarball=agent-plugin-ci-cli-${p.version}.tgz\nartifact=agentplugin-cli-release-${p.version}\n`);'
+      - name: Full verification
+        run: pnpm verify
+      - name: OpenAPI release smoke
+        run: |
+          node apps/cli/dist/index.cjs build --openapi fixtures/openapi/support.yaml --name release-openapi --out dist/release-openapi
+          node apps/cli/dist/index.cjs validate dist/release-openapi
+          node apps/cli/dist/index.cjs scan dist/release-openapi
+          node apps/cli/dist/index.cjs compat dist/release-openapi --all
+          node apps/cli/dist/index.cjs certify dist/release-openapi
+      - name: MCP release smoke
+        run: |
+          node apps/cli/dist/index.cjs build --mcp fixtures/mcp/stdio.json --no-discover --name release-mcp --out dist/release-mcp
+          node apps/cli/dist/index.cjs validate dist/release-mcp
+          node apps/cli/dist/index.cjs scan dist/release-mcp
+          node apps/cli/dist/index.cjs compat dist/release-mcp --all
+          node apps/cli/dist/index.cjs certify dist/release-mcp
+      - name: PluginIR release smoke
+        run: |
+          node apps/cli/dist/index.cjs build --ir fixtures/hello/plugin-ir.json --out dist/release-ir
+          node apps/cli/dist/index.cjs validate dist/release-ir
+          node apps/cli/dist/index.cjs scan dist/release-ir
+          node apps/cli/dist/index.cjs compat dist/release-ir --all
+          node apps/cli/dist/index.cjs certify dist/release-ir
+      - name: Pack and verify release unit
+        run: |
+          pnpm pack:cli
+          pnpm verify:package
+          pnpm verify:package:checksum
       - name: Installed release package smoke
         run: |
           mkdir -p "$RUNNER_TEMP/agentplugin-release-smoke"
           cd "$RUNNER_TEMP/agentplugin-release-smoke"
           npm init -y >/dev/null
-          npm install "$GITHUB_WORKSPACE"/artifacts/*.tgz --ignore-scripts
-          ./node_modules/.bin/agentplugin --version
-          ./node_modules/.bin/agentplugin build --openapi "$GITHUB_WORKSPACE/fixtures/openapi/search.json" --name release-smoke --out out --json
+          npm install "$GITHUB_WORKSPACE/artifacts/${{ steps.release.outputs.tarball }}" --ignore-scripts --no-audit --no-fund
+          test "$(./node_modules/.bin/agentplugin --version)" = "${{ steps.release.outputs.version }}"
+          ./node_modules/.bin/agentplugin build --openapi "$GITHUB_WORKSPACE/fixtures/openapi/search.json" --name release-installed --out out --json
           ./node_modules/.bin/agentplugin validate out --json
           ./node_modules/.bin/agentplugin scan out --json
           ./node_modules/.bin/agentplugin compat out --all --json
           ./node_modules/.bin/agentplugin certify out --json
-      - name: Create GitHub release
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.release.outputs.artifact }}
+          path: |
+            artifacts/${{ steps.release.outputs.tarball }}
+            artifacts/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      RELEASE_VERSION: ${{ needs.package.outputs.version }}
+      RELEASE_TARBALL: ${{ needs.package.outputs.tarball }}
+      NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/agentplugin-release.npmrc
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.package.outputs.artifact }}
+          path: release-artifact
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.14.0
+      - name: Verify downloaded release unit
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" == "v$RELEASE_VERSION" ]]
+          [[ "$RELEASE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]
+          [[ "$RELEASE_TARBALL" == "agent-plugin-ci-cli-$RELEASE_VERSION.tgz" ]]
+          ARTIFACT_DIR="$(realpath release-artifact)"
+          TARBALL_PATH="$ARTIFACT_DIR/$RELEASE_TARBALL"
+          CHECKSUM_PATH="$ARTIFACT_DIR/SHA256SUMS"
+          [[ "$(find "$ARTIFACT_DIR" -mindepth 1 -maxdepth 1 | wc -l)" -eq 2 ]]
+          [[ -f "$TARBALL_PATH" && ! -L "$TARBALL_PATH" ]]
+          [[ -f "$CHECKSUM_PATH" && ! -L "$CHECKSUM_PATH" ]]
+          IFS= read -r checksum_line < "$CHECKSUM_PATH"
+          [[ "$(wc -l < "$CHECKSUM_PATH")" -eq 1 ]]
+          read -r actual_checksum _ < <(sha256sum "$TARBALL_PATH")
+          [[ "$checksum_line" == "$actual_checksum  $RELEASE_TARBALL" ]]
+          (cd "$ARTIFACT_DIR" && sha256sum --check --strict SHA256SUMS)
+          tar --extract --gzip --to-stdout --file="$TARBALL_PATH" package/package.json > "$RUNNER_TEMP/release-package.json"
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const p = JSON.parse(readFileSync(process.env.RUNNER_TEMP + "/release-package.json", "utf8"));
+            if (p.name !== "@agent-plugin-ci/cli" || p.version !== process.env.RELEASE_VERSION || p.private !== false ||
+                p.repository?.type !== "git" || p.repository?.url !== "https://github.com/FutraDay/AgentPluginCI.git" ||
+                p.repository?.directory !== "apps/cli" || p.publishConfig?.access !== "public" ||
+                p.bin?.agentplugin !== "dist/index.cjs") {
+              console.error("Downloaded tarball metadata does not match the release"); process.exit(1);
+            }'
+      - name: Refuse an existing npm or GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" artifacts/*.tgz --generate-notes --verify-tag
+        run: >-
+          node --input-type=module -e
+          'if (process.env.GITHUB_REPOSITORY !== "FutraDay/AgentPluginCI") throw new Error("Unexpected release repository");
+          const headers = { Accept: "application/vnd.github+json", Authorization: `Bearer ${process.env.GH_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" };
+          const releaseUrl = `${process.env.GITHUB_API_URL}/repos/${process.env.GITHUB_REPOSITORY}/releases/tags/${encodeURIComponent(process.env.GITHUB_REF_NAME)}`;
+          const releaseResponse = await fetch(releaseUrl, { headers });
+          if (releaseResponse.status === 200) throw new Error("GitHub release already exists");
+          if (releaseResponse.status !== 404) throw new Error(`GitHub release preflight failed with status ${releaseResponse.status}`);
+          const npmUrl = `https://registry.npmjs.org/@agent-plugin-ci%2fcli/${encodeURIComponent(process.env.RELEASE_VERSION)}`;
+          const npmResponse = await fetch(npmUrl, { headers: { Accept: "application/json" } });
+          if (npmResponse.status === 200) throw new Error("npm package version already exists");
+          if (npmResponse.status !== 404) throw new Error(`npm release preflight failed with status ${npmResponse.status}`);'
+      - name: Pin trusted-publishing npm CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'registry=https://registry.npmjs.org/\n' > "$NPM_CONFIG_USERCONFIG"
+          if [[ "$(npm --version)" != "11.19.0" ]]; then
+            npm install --global npm@11.19.0 --ignore-scripts --no-audit --no-fund
+            hash -r
+          fi
+          test "$(npm --version)" = "11.19.0"
+      - name: Publish verified tarball with npm trusted publishing
+        env:
+          NPM_CONFIG_IGNORE_SCRIPTS: "true"
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${NODE_AUTH_TOKEN:-}" || -n "${NPM_TOKEN:-}" || -n "${NPM_CONFIG_TOKEN:-}" ]]; then
+            echo "Refusing to publish with a long-lived npm token" >&2
+            exit 1
+          fi
+          if grep -Eiq '(_auth|token)' "$NPM_CONFIG_USERCONFIG"; then
+            echo "Refusing to publish with npm auth material in user config" >&2
+            exit 1
+          fi
+          test "$(node --version)" = "v22.14.0"
+          test "$(npm --version)" = "11.19.0"
+          npm publish "release-artifact/$RELEASE_TARBALL" --access public --provenance --ignore-scripts
+      - name: Create GitHub release from verified tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "release-artifact/$RELEASE_TARBALL#npm package" \
+            "release-artifact/SHA256SUMS#SHA-256 checksum" \
+            --repo "$GITHUB_REPOSITORY" \
+            --generate-notes \
+            --verify-tag

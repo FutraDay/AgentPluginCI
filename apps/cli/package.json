@@ -7,6 +7,11 @@
   "bin": { "agentplugin": "dist/index.cjs" },
   "files": ["dist"],
   "engines": { "node": ">=22.13" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FutraDay/AgentPluginCI.git",
+    "directory": "apps/cli"
+  },
   "publishConfig": { "access": "public" },
   "devDependencies": {
     "@agent-plugin-ci/certification": "workspace:*",
@@ -23,7 +28,6 @@
     "start": "tsx src/index.ts",
     "build": "node scripts/build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run --passWithNoTests",
-    "prepack": "pnpm run build && node dist/index.cjs --version"
+    "test": "vitest run --passWithNoTests"
   }
 }

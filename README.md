@@ -183,6 +183,8 @@ pnpm typecheck
 pnpm test
 pnpm build
 pnpm pack:cli
+pnpm verify:package
+pnpm verify:package:checksum
 git diff --check
 git status
 ```
@@ -191,8 +193,8 @@ git status
 
 ## Release packaging
 
-The CLI package is configured at version `0.1.0` with the executable name `agentplugin`. `pnpm pack:cli` creates the npm tarball under `artifacts/`.
+The CLI package is configured at version `0.1.0` with the executable name `agentplugin`. After a repository build, `pnpm pack:cli` creates the npm tarball under `artifacts/`. The tarball is the release unit: `pnpm verify:package` parses it without extraction, rejects unexpected files, unsafe archive entries, or incorrect publish metadata, and writes `artifacts/SHA256SUMS`; `pnpm verify:package:checksum` rechecks that checksum portably on Windows or Linux.
 
-GitHub Actions performs the same verification on pushes and pull requests, including MCP, OpenAPI and raw PluginIR CLI smoke builds plus an install-and-run test of the packed npm tarball. Tags matching `v*` run the full verification pipeline, require the tag to match the CLI package version, install and smoke-test the release tarball, and create a GitHub release containing that artifact.
+GitHub Actions performs the same verification on branch pushes and pull requests, including MCP, OpenAPI and raw PluginIR CLI smoke builds plus an install-and-run test of the packed npm tarball. Tags matching `v*` run a two-stage release: a read-only job verifies the tag/version, tests and packages once, checks the tarball contract and checksum, and runs the installed CLI smoke; a separate publishing job downloads that exact tarball, rechecks its identity and checksum, publishes it to npm through trusted publishing, and attaches the same tarball and checksum to the GitHub release.
 
-Actual npm publication is intentionally not automated until the npm organization/package ownership and publishing credentials are configured. That keeps the repository release-ready without introducing a secret or account dependency into v0.1 hardening.
+One-time npm setup is required in the `@agent-plugin-ci/cli` package settings: add a GitHub Actions trusted publisher for owner/organization `FutraDay`, repository `AgentPluginCI`, workflow filename `release.yml`, and allow `npm publish`. Leave the environment field unset because this workflow does not declare a GitHub environment. The publish job runs on Node.js 22.14.0, pins npm CLI `11.19.0` (above the npm trusted-publishing minimum of 11.5.1), requests `id-token: write` only for OIDC trusted publishing, and publishes with provenance. It has no `NPM_TOKEN` or other long-lived token fallback and fails closed until the trusted publisher is configured. After the first successful OIDC publish, npm recommends setting package **Publishing access** to **Require two-factor authentication and disallow tokens**; trusted publishing continues to work because it uses OIDC rather than traditional npm access tokens.

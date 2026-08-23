@@ -3,14 +3,20 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FutraDay/AgentPluginCI.git"
+  },
   "packageManager": "pnpm@11.2.2",
   "scripts": {
     "build": "pnpm -r build",
-    "test": "pnpm -r test",
+    "test": "pnpm -r test && node --test scripts/verify-cli-package.test.mjs",
     "typecheck": "pnpm -r typecheck",
     "verify": "pnpm typecheck && pnpm test && pnpm build",
     "cli": "pnpm --filter @agent-plugin-ci/cli start",
-    "pack:cli": "pnpm --filter @agent-plugin-ci/cli pack --pack-destination artifacts"
+    "pack:cli": "pnpm --filter @agent-plugin-ci/cli pack --pack-destination artifacts",
+    "verify:package": "node scripts/verify-cli-package.mjs",
+    "verify:package:checksum": "node scripts/verify-cli-package.mjs --check"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
