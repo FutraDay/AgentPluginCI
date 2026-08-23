@@ -85,6 +85,7 @@ jobs:
           }));
           NODE
           ./node_modules/.bin/agentplugin compat-runtime runtime-package --allow-stdio-runtime --timeout-ms 5000 --json
+          ./node_modules/.bin/agentplugin compat-runtime runtime-package --client-adapter synthetic-fixture --allow-client-runtime --allow-synthetic-fixture --json
       - run: git diff --check
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

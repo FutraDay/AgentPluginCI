@@ -448,6 +448,80 @@ describe("Agent Plugin CI CLI", () => {
     expect(textCap.stdout).toContain("RUNTIME_CLIENT install=not-assessed load=not-assessed mcp-handshake=verified");
   }, 15_000);
 
+  it("runs the explicitly enabled synthetic client fixture in JSON and text modes", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-client-fixture-cli-"));
+    await writeFile(join(cwd, "plugin.json"), JSON.stringify({
+      $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", name: "client-fixture-cli"
+    }), "utf8");
+    const fixtureArgs = [
+      "compat-runtime", cwd,
+      "--client-adapter", "synthetic-fixture",
+      "--allow-client-runtime",
+      "--allow-synthetic-fixture"
+    ];
+
+    const jsonCap = capture();
+    expect(await runCli([...fixtureArgs, "--json"], { cwd, ...jsonCap.io })).toBe(0);
+    expect(JSON.parse(jsonCap.stdout[0]!)).toMatchObject({
+      ok: true,
+      command: "compat-runtime",
+      scope: "client-adapter-harness",
+      synthetic: true,
+      adapter: { id: "synthetic-fixture", version: "1.0.0-fixture" },
+      targetClient: { id: "synthetic-fixture-client", version: "0.0.0-fixture" },
+      execution: { status: "pass", complete: true, finalize: "complete" },
+      packageInstall: "observed",
+      clientLoad: "observed",
+      interoperability: "not-established"
+    });
+    expect(jsonCap.stdout[0]).toContain("does not establish interoperability with any real client");
+
+    const textCap = capture();
+    expect(await runCli(fixtureArgs, { cwd, ...textCap.io })).toBe(0);
+    expect(textCap.stdout.some((line) => line.startsWith("CLIENT_RUNTIME_PASS"))).toBe(true);
+    expect(textCap.stdout).toContain("CLIENT_RUNTIME_SCOPE client-adapter-harness complete=true synthetic=true interoperability=not-established");
+    expect(textCap.stdout).toContain("CLIENT_OBSERVATIONS install=observed load=observed finalize=complete");
+  });
+
+  it("keeps client adapter execution and the synthetic fixture deny-by-default", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-client-denied-cli-"));
+    await writeFile(join(cwd, "plugin.json"), JSON.stringify({
+      $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", name: "client-denied-cli"
+    }), "utf8");
+
+    const denied = capture();
+    expect(await runCli([
+      "compat-runtime", cwd, "--client-adapter", "synthetic-fixture", "--allow-synthetic-fixture", "--json"
+    ], { cwd, ...denied.io })).toBe(1);
+    expect(JSON.parse(denied.stdout[0]!)).toMatchObject({
+      ok: false,
+      synthetic: true,
+      execution: { status: "denied", complete: false, finalize: "not-run" },
+      packageInstall: "not-assessed",
+      clientLoad: "not-assessed",
+      interoperability: "not-established"
+    });
+
+    const fixtureNotAllowed = capture();
+    expect(await runCli([
+      "compat-runtime", cwd, "--client-adapter", "synthetic-fixture", "--allow-client-runtime", "--json"
+    ], { cwd, ...fixtureNotAllowed.io })).toBe(2);
+    expect(JSON.parse(fixtureNotAllowed.stdout[0]!)).toMatchObject({ error: { code: "USAGE_ERROR" }, exitCode: 2 });
+  });
+
+  it("rejects unknown client adapters and mixed MCP/client runtime permissions", async () => {
+    const unknown = capture();
+    expect(await runCli(["compat-runtime", ".", "--client-adapter", "cursor", "--json"], unknown.io)).toBe(2);
+    expect(JSON.parse(unknown.stdout[0]!)).toMatchObject({ error: { code: "USAGE_ERROR" }, exitCode: 2 });
+    expect(unknown.stdout[0]).not.toContain("Cursor Agent Plugins");
+
+    const mixed = capture();
+    expect(await runCli([
+      "compat-runtime", ".", "--client-adapter", "synthetic-fixture", "--allow-stdio-runtime", "--json"
+    ], mixed.io)).toBe(2);
+    expect(JSON.parse(mixed.stdout[0]!)).toMatchObject({ error: { code: "USAGE_ERROR" }, exitCode: 2 });
+  });
+
   it("denies stdio runtime execution by default", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "agentplugin-runtime-denied-cli-"));
     const markerPath = join(cwd, "executed.txt");

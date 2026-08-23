@@ -5,8 +5,13 @@ import {
   assessPackageRuntimeCompatibility,
   assessPluginCompatibility,
   BUILT_IN_COMPATIBILITY_PROFILES,
+  ClientRuntimeAdapterRegistry,
+  createSyntheticFixtureClientAdapter,
   PORTABLE_CORE_PROFILE_ID,
+  runClientRuntimeHarness,
+  UnknownClientRuntimeAdapterError,
   UnknownCompatibilityProfileError,
+  type ClientRuntimeReport,
   type CompatibilitySuiteReport,
   type RuntimeCompatibilityOptions,
   type RuntimeCompatibilityReport
@@ -32,6 +37,7 @@ import cliPackage from "../package.json" with { type: "json" };
 
 export const CLI_VERSION = cliPackage.version;
 const MAX_JSON_BYTES = 1_000_000;
+const CLI_CLIENT_ADAPTERS = new ClientRuntimeAdapterRegistry([createSyntheticFixtureClientAdapter()]);
 
 export interface CliIo {
   cwd?: string;
@@ -276,7 +282,7 @@ async function runCompatRuntime(
   stdout: (message: string) => void,
   stderr: (message: string) => void
 ): Promise<number> {
-  const { target, json, options } = parseCompatRuntimeArgs(args);
+  const { target, json, options, client } = parseCompatRuntimeArgs(args);
   const resolved = resolve(cwd, target);
   const info = await lstat(resolved).catch(() => undefined);
   if (!info) throw new CliError(`Runtime compatibility target not found: ${target}`, "RUNTIME_COMPATIBILITY_INPUT_ERROR");
@@ -284,6 +290,37 @@ async function runCompatRuntime(
     throw new CliError("Runtime compatibility target must be a regular package directory or its regular plugin.json file", "RUNTIME_COMPATIBILITY_INPUT_ERROR");
   }
   const packageDir = info.isDirectory() ? resolved : dirname(resolved);
+  if (client) {
+    let adapter;
+    try {
+      adapter = CLI_CLIENT_ADAPTERS.get(client.adapterId);
+    } catch (error) {
+      if (error instanceof UnknownClientRuntimeAdapterError) {
+        throw new CliError(
+          `${error.message}. Available adapters: ${CLI_CLIENT_ADAPTERS.list().map((item) => item.adapter.id).join(", ")}`,
+          "USAGE_ERROR",
+          2
+        );
+      }
+      throw error;
+    }
+    if (adapter.metadata.synthetic && !client.allowSyntheticFixture) {
+      throw new CliError(
+        "The synthetic fixture adapter requires --allow-synthetic-fixture and never represents a real client test",
+        "USAGE_ERROR",
+        2
+      );
+    }
+    const report = await runClientRuntimeHarness(packageDir, adapter, {
+      allowExecution: client.allowExecution,
+      ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {})
+    });
+    const ok = report.execution.status === "pass" && report.execution.complete;
+    const payload = { ok, command: "compat-runtime", version: CLI_VERSION, target: packageDir, ...report };
+    if (json) stdout(JSON.stringify(payload));
+    else renderClientRuntimeCompatibility(payload, stdout, stderr);
+    return ok ? 0 : 1;
+  }
   const report = await assessPackageRuntimeCompatibility(packageDir, options);
   const ok = report.status === "pass" && report.complete && report.servers.length > 0;
   const payload = { ok, command: "compat-runtime", version: CLI_VERSION, target: packageDir, ...report };
@@ -455,11 +492,19 @@ function parseCompatArgs(args: string[]): { target: string; json: boolean; profi
   return { target, json, profileIds };
 }
 
-function parseCompatRuntimeArgs(args: string[]): { target: string; json: boolean; options: RuntimeCompatibilityOptions } {
+function parseCompatRuntimeArgs(args: string[]): {
+  target: string;
+  json: boolean;
+  options: RuntimeCompatibilityOptions;
+  client?: { adapterId: string; allowExecution: boolean; allowSyntheticFixture: boolean };
+} {
   let target = ".";
   let seenTarget = false;
   let json = false;
   let timeoutMs: number | undefined;
+  let clientAdapterId: string | undefined;
+  let allowClientRuntime = false;
+  let allowSyntheticFixture = false;
   const options: RuntimeCompatibilityOptions = {};
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!;
@@ -467,6 +512,15 @@ function parseCompatRuntimeArgs(args: string[]): { target: string; json: boolean
     if (arg === "--allow-stdio-runtime") { options.allowStdioRuntime = true; continue; }
     if (arg === "--allow-private-network") { options.allowPrivateNetwork = true; continue; }
     if (arg === "--allow-insecure-http") { options.allowInsecureHttp = true; continue; }
+    if (arg === "--allow-client-runtime") { allowClientRuntime = true; continue; }
+    if (arg === "--allow-synthetic-fixture") { allowSyntheticFixture = true; continue; }
+    if (arg === "--client-adapter") {
+      const value = args[++index];
+      if (!value || value.startsWith("--")) throw new CliError("--client-adapter requires an adapter id", "USAGE_ERROR", 2);
+      if (clientAdapterId !== undefined) throw new CliError("--client-adapter may only be provided once", "USAGE_ERROR", 2);
+      clientAdapterId = value;
+      continue;
+    }
     if (arg === "--timeout-ms") {
       const value = args[++index];
       if (!value || !/^\d+$/.test(value)) throw new CliError("--timeout-ms requires an integer from 100 to 30000", "USAGE_ERROR", 2);
@@ -480,6 +534,20 @@ function parseCompatRuntimeArgs(args: string[]): { target: string; json: boolean
     seenTarget = true;
   }
   if (timeoutMs !== undefined) options.timeoutMs = timeoutMs;
+  if (clientAdapterId !== undefined) {
+    if (options.allowStdioRuntime || options.allowPrivateNetwork || options.allowInsecureHttp) {
+      throw new CliError("MCP runtime permission options cannot be combined with --client-adapter", "USAGE_ERROR", 2);
+    }
+    return {
+      target,
+      json,
+      options,
+      client: { adapterId: clientAdapterId, allowExecution: allowClientRuntime, allowSyntheticFixture }
+    };
+  }
+  if (allowClientRuntime || allowSyntheticFixture) {
+    throw new CliError("Client runtime opt-ins require --client-adapter", "USAGE_ERROR", 2);
+  }
   return { target, json, options };
 }
 
@@ -818,6 +886,21 @@ function renderRuntimeCompatibility(
   write(`NOTE ${sanitizeConsoleText(payload.note)}`);
 }
 
+function renderClientRuntimeCompatibility(
+  payload: ClientRuntimeReport & { ok: boolean; target: string },
+  stdout: (message: string) => void,
+  stderr: (message: string) => void
+): void {
+  const write = payload.ok ? stdout : stderr;
+  write(`CLIENT_RUNTIME_${payload.execution.status.toUpperCase().replace("-", "_")} ${sanitizeConsoleText(payload.target)}`);
+  write(`CLIENT_RUNTIME_SCOPE ${payload.scope} complete=${payload.execution.complete} synthetic=${payload.synthetic} interoperability=${payload.interoperability}`);
+  write(`CLIENT_ADAPTER ${payload.adapter.id}@${payload.adapter.version}`);
+  write(`TARGET_CLIENT ${payload.targetClient.id}${payload.targetClient.version ? `@${payload.targetClient.version}` : "@unknown"}`);
+  write(`CLIENT_OBSERVATIONS install=${payload.packageInstall} load=${payload.clientLoad} finalize=${payload.execution.finalize}`);
+  for (const item of payload.evidence) write(`[${item.code}] ${sanitizeConsoleText(item.summary)}`);
+  write(`NOTE ${sanitizeConsoleText(payload.note)}`);
+}
+
 function renderCertification(
   payload: CertificationReport & { ok: boolean; target: string },
   stdout: (message: string) => void,
@@ -931,8 +1014,11 @@ Runtime compatibility options:
   --allow-stdio-runtime           Explicitly permit stdio MCP process execution for this runtime assessment
   --allow-private-network         Permit private-network remote MCP runtime targets
   --allow-insecure-http           Permit insecure HTTP remote MCP runtime targets
-  --timeout-ms <100-30000>        Per-server MCP initialize timeout (default: 5000)
-  --json                          Emit bounded runtime startup/handshake evidence as JSON
+  --timeout-ms <100-30000>        MCP initialize or client lifecycle timeout (default: 5000)
+  --client-adapter <id>           Use a client harness adapter (only synthetic-fixture is currently available)
+  --allow-client-runtime          Explicitly permit the selected client adapter lifecycle
+  --allow-synthetic-fixture       Permit the synthetic-fixture test adapter (never real evidence)
+  --json                          Emit bounded MCP or client-runtime evidence as JSON
 
 Certification:
   Aggregates official validation, fail-on-high security, and the three pinned Phase 2J
@@ -944,6 +1030,7 @@ Exit codes:
   1  Build, input, security, validation, compatibility, or certification failure/unknown
   2  Invalid CLI usage
 
-Security defaults are deny-by-default for stdio execution, private-network access,
-insecure HTTP, cross-origin OpenAPI refs, and external file refs.`;
+Security defaults are deny-by-default for stdio and client-adapter execution,
+synthetic fixtures, private-network access, insecure HTTP, cross-origin OpenAPI refs,
+and external file refs.`;
 }
