@@ -8,6 +8,11 @@ import {
   UnknownCompatibilityProfileError,
   type CompatibilitySuiteReport
 } from "@agent-plugin-ci/compatibility";
+import {
+  certifyPluginEvidence,
+  STATIC_PORTABILITY_POLICY,
+  type CertificationReport
+} from "@agent-plugin-ci/certification";
 import { compilePlugin, type CompiledPlugin } from "@agent-plugin-ci/compiler";
 import { createSdkMcpToolDiscoverer, ingestMcpConfig, mcpConfigFromUrl } from "@agent-plugin-ci/ingest-mcp";
 import { ingestOpenApiSource } from "@agent-plugin-ci/ingest-openapi";
@@ -75,6 +80,7 @@ export async function runCli(rawArgs: string[], io: CliIo = {}): Promise<number>
     if (args[0] === "validate") return await runValidate(args.slice(1), cwd, stdout, stderr);
     if (args[0] === "scan") return await runScan(args.slice(1), cwd, stdout, stderr);
     if (args[0] === "compat") return await runCompat(args.slice(1), cwd, stdout, stderr);
+    if (args[0] === "certify") return await runCertify(args.slice(1), cwd, stdout, stderr);
     throw new CliError(`Unknown command: ${args[0]}`, "USAGE_ERROR", 2);
   } catch (error) {
     return renderFailure(error, json, stdout, stderr);
@@ -260,6 +266,37 @@ async function runCompat(
   return ok ? 0 : 1;
 }
 
+async function runCertify(
+  args: string[],
+  cwd: string,
+  stdout: (message: string) => void,
+  stderr: (message: string) => void
+): Promise<number> {
+  const { target, json } = parseCertifyArgs(args);
+  const resolved = resolve(cwd, target);
+  const info = await lstat(resolved).catch(() => undefined);
+  if (!info) throw new CliError(`Certification target not found: ${target}`, "CERTIFICATION_INPUT_ERROR");
+  if (info.isSymbolicLink() || (!info.isDirectory() && (!info.isFile() || basename(resolved) !== "plugin.json"))) {
+    throw new CliError("Certification target must be a regular package directory or its regular plugin.json file", "CERTIFICATION_INPUT_ERROR");
+  }
+  const packageDir = info.isDirectory() ? resolved : dirname(resolved);
+  const packageInfo = await lstat(packageDir).catch(() => undefined);
+  if (!packageInfo?.isDirectory() || packageInfo.isSymbolicLink()) {
+    throw new CliError("Certification package root must be a regular directory", "CERTIFICATION_INPUT_ERROR");
+  }
+  const profileIds = STATIC_PORTABILITY_POLICY.compatibility.requiredProfiles.map((profile) => profile.id);
+  const [validation, security, compatibility] = await Promise.all([
+    collectCertificationValidation(packageDir),
+    scanPackageSecurity(packageDir),
+    assessPackageCompatibility(packageDir, profileIds)
+  ]);
+  const report = certifyPluginEvidence({ validation, security, compatibility });
+  const payload = { ok: report.status === "certified", command: "certify", version: CLI_VERSION, target: packageDir, ...report };
+  if (json) stdout(JSON.stringify(payload));
+  else renderCertification(payload, stdout, stderr);
+  return payload.ok ? 0 : 1;
+}
+
 function parseBuildArgs(args: string[]): ParsedBuildOptions {
   const valueOptions = new Set(["--mcp", "--openapi", "--ir", "--out", "--name"]);
   const booleanOptions = new Set([
@@ -392,6 +429,24 @@ function parseCompatArgs(args: string[]): { target: string; json: boolean; profi
   return { target, json, profileIds };
 }
 
+function parseCertifyArgs(args: string[]): { target: string; json: boolean } {
+  let target = ".";
+  let seenTarget = false;
+  let json = false;
+  for (const arg of args) {
+    if (arg === "--json") {
+      if (json) throw new CliError("--json may only be provided once", "USAGE_ERROR", 2);
+      json = true;
+      continue;
+    }
+    if (arg.startsWith("--")) throw new CliError(`Unknown certify option: ${arg}`, "USAGE_ERROR", 2);
+    if (seenTarget) throw new CliError("certify accepts only one target", "USAGE_ERROR", 2);
+    target = arg;
+    seenTarget = true;
+  }
+  return { target, json };
+}
+
 function validateSourceSpecificFlags(sourceKind: SourceKind, flags: Set<string>): void {
   const mcpOnly = ["--no-discover", "--allow-stdio-discovery"];
   const openApiOnly = ["--allow-cross-origin-refs", "--allow-external-file-refs"];
@@ -409,7 +464,7 @@ function validateSourceSpecificFlags(sourceKind: SourceKind, flags: Set<string>)
 }
 
 function normalizeLegacyArgs(args: string[]): string[] {
-  if (["build", "validate", "scan", "compat"].includes(args[0]!)) return args;
+  if (["build", "validate", "scan", "compat", "certify"].includes(args[0]!)) return args;
   if (args[0]?.startsWith("--")) return ["build", ...args];
   if (args[0]) {
     const [input, maybeOut, ...rest] = args;
@@ -549,6 +604,41 @@ async function readJsonRecord(path: string, label: string): Promise<Record<strin
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new CliError(`${label} must contain a JSON object`, "VALIDATION_INPUT_ERROR");
   return value as Record<string, unknown>;
 }
+
+async function collectCertificationValidation(packageDir: string): Promise<ValidationResult> {
+  const manifestRead = await readCertificationJsonRecord(join(packageDir, "plugin.json"), "plugin.json", true);
+  const mcpRead = await readCertificationJsonRecord(join(packageDir, "mcp.json"), "mcp.json", false);
+  const result = validateCompiledPlugin(manifestRead.value, mcpRead.value);
+  const inputErrors = [manifestRead.error, mcpRead.error].filter((message): message is string => Boolean(message));
+  return {
+    ok: result.ok && inputErrors.length === 0,
+    errors: [...new Set([...result.errors, ...inputErrors])],
+    warnings: result.warnings
+  };
+}
+
+async function readCertificationJsonRecord(
+  path: string,
+  label: string,
+  required: boolean
+): Promise<{ value?: Record<string, unknown>; error?: string }> {
+  let info;
+  try {
+    info = await lstat(path);
+  } catch (error) {
+    if (!required && (error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    return { error: `${label} is missing or could not be read safely` };
+  }
+  if (info.isSymbolicLink() || !info.isFile()) return { error: `${label} must be a regular file and not a symbolic link` };
+  if (info.size > MAX_JSON_BYTES) return { error: `${label} exceeds the ${MAX_JSON_BYTES} byte certification input limit` };
+  try {
+    const value = JSON.parse(await readFile(path, "utf8")) as unknown;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return { error: `${label} must contain a JSON object` };
+    return { value: value as Record<string, unknown> };
+  } catch {
+    return { error: `${label} is not valid JSON` };
+  }
+}
 function resolveSource(cwd: string, source: string): string {
   return /^https?:\/\//i.test(source) ? source : resolve(cwd, source);
 }
@@ -656,6 +746,25 @@ function renderCompatibility(
   write(`NOTE ${sanitizeConsoleText(payload.runtimeEvidence.note)}`);
 }
 
+function renderCertification(
+  payload: CertificationReport & { ok: boolean; target: string },
+  stdout: (message: string) => void,
+  stderr: (message: string) => void
+): void {
+  const write = payload.ok ? stdout : stderr;
+  write(`CERTIFICATION_${payload.status.toUpperCase().replace("-", "_")} ${sanitizeConsoleText(payload.target)}`);
+  write(`CERTIFICATION_POLICY ${payload.policy.id}@${payload.policy.version} complete=${payload.complete}`);
+  for (const check of payload.checks) {
+    write(`[${check.status.toUpperCase()}] ${check.id}@${check.version}: ${sanitizeConsoleText(check.title)}`);
+    for (const evidence of check.evidence) {
+      write(`  Evidence ${sanitizeConsoleText(evidence.location)}: ${sanitizeConsoleText(evidence.summary)}`);
+      if (evidence.remediation) write(`  Remediation: ${sanitizeConsoleText(evidence.remediation)}`);
+    }
+  }
+  write("RUNTIME_EVIDENCE verified=false client-install=not-assessed mcp-handshake=not-assessed");
+  write(`NOTE ${sanitizeConsoleText(payload.runtimeEvidence.note)}`);
+}
+
 function renderFailure(
   error: unknown,
   json: boolean,
@@ -714,6 +823,7 @@ Usage:
   agentplugin validate [package-dir|plugin.json] [--json]
   agentplugin scan [package-dir|plugin.json] [--fail-on <severity>] [--json]
   agentplugin compat [package-dir|plugin.json] [--profile <id>|--all] [--json]
+  agentplugin certify [package-dir|plugin.json] [--json]
   agentplugin --version
 
 Build options:
@@ -744,9 +854,14 @@ Compatibility options:
   --all                           Run every built-in static compatibility profile
   --json                          Emit deterministic static evidence and summaries as JSON
 
+Certification:
+  Aggregates official validation, fail-on-high security, and the three pinned Phase 2J
+  compatibility profiles. Static certification does not prove runtime interoperability.
+  --json                          Emit the deterministic certification report as JSON
+
 Exit codes:
   0  Success
-  1  Build, input, security, validation, or compatibility failure
+  1  Build, input, security, validation, compatibility, or certification failure/unknown
   2  Invalid CLI usage
 
 Security defaults are deny-by-default for stdio execution, private-network access,

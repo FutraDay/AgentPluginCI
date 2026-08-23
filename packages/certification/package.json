@@ -1,0 +1,18 @@
+{
+  "name": "@agent-plugin-ci/certification",
+  "version": "0.1.0",
+  "description": "Deterministic static certification aggregation for Agent Plugin CI evidence.",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@agent-plugin-ci/compatibility": "workspace:*",
+    "@agent-plugin-ci/security": "workspace:*",
+    "@agent-plugin-ci/validator": "workspace:*"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests"
+  }
+}

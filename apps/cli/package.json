@@ -1,7 +1,7 @@
 {
   "name": "@agent-plugin-ci/cli",
   "version": "0.1.0",
-  "description": "Build, validate, scan, and compatibility-test portable Agent Plugins from MCP, OpenAPI, or PluginIR sources.",
+  "description": "Build, validate, scan, compatibility-test, and certify portable Agent Plugins from MCP, OpenAPI, or PluginIR sources.",
   "private": false,
   "type": "module",
   "bin": { "agentplugin": "dist/index.cjs" },
@@ -9,6 +9,7 @@
   "engines": { "node": ">=22.13" },
   "publishConfig": { "access": "public" },
   "devDependencies": {
+    "@agent-plugin-ci/certification": "workspace:*",
     "@agent-plugin-ci/compatibility": "workspace:*",
     "@agent-plugin-ci/compiler": "workspace:*",
     "@agent-plugin-ci/ingest-mcp": "workspace:*",

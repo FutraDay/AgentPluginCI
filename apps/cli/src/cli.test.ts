@@ -320,7 +320,7 @@ describe("Agent Plugin CI CLI", () => {
     expect(cap.stderr.every((message) => !message.includes("\n"))).toBe(true);
   });
 
-  it("runs MCP, OpenAPI, and PluginIR through validate, scan, and compatibility", async () => {
+  it("runs MCP, OpenAPI, and PluginIR through validation, security, compatibility, and certification", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "agentplugin-compat-e2e-"));
     const builds = [
       ["build", "--mcp", join(repoRoot, "fixtures/mcp/stdio.json"), "--no-discover", "--name", "e2e-mcp"],
@@ -333,7 +333,96 @@ describe("Agent Plugin CI CLI", () => {
       expect(await runCli(["validate", out], { cwd, ...capture().io })).toBe(0);
       expect(await runCli(["scan", out], { cwd, ...capture().io })).toBe(0);
       expect(await runCli(["compat", out, "--all"], { cwd, ...capture().io })).toBe(0);
+      const certification = capture();
+      expect(await runCli(["certify", out, "--json"], { cwd, ...certification.io })).toBe(0);
+      expect(JSON.parse(certification.stdout[0]!)).toMatchObject({
+        ok: true,
+        command: "certify",
+        status: "certified",
+        runtimeEvidence: { runtimeVerified: false, clientInstall: "not-assessed", mcpHandshake: "not-assessed" }
+      });
     }
+  });
+
+  it("certifies package directories and plugin.json deterministically with pinned profiles", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-certify-"));
+    const out = join(cwd, "out");
+    expect(await runCli(["build", "--ir", join(repoRoot, "fixtures/hello/plugin-ir.json"), "--out", out], { cwd, ...capture().io })).toBe(0);
+    const first = capture();
+    const second = capture();
+    expect(await runCli(["certify", out, "--json"], { cwd, ...first.io })).toBe(0);
+    expect(await runCli(["certify", join(out, "plugin.json"), "--json"], { cwd, ...second.io })).toBe(0);
+    expect(first.stdout[0]).toBe(second.stdout[0]);
+    expect(JSON.parse(first.stdout[0]!).policy.compatibility.requiredProfiles).toEqual([
+      { id: "agent-plugins-1.0-portable-core", version: "1.0.0" },
+      { id: "cursor-agent-plugins-1.0", version: "1.0.0" },
+      { id: "vscode-github-copilot-agent-plugins-1.0", version: "1.0.0" }
+    ]);
+  });
+
+  it("returns non-certified for validation errors and high security findings", async () => {
+    const invalid = await mkdtemp(join(tmpdir(), "agentplugin-cert-invalid-"));
+    await writeFile(join(invalid, "plugin.json"), JSON.stringify({ name: "missing-schema" }), "utf8");
+    const invalidCap = capture();
+    expect(await runCli(["certify", invalid, "--json"], { cwd: invalid, ...invalidCap.io })).toBe(1);
+    expect(JSON.parse(invalidCap.stdout[0]!)).toMatchObject({ status: "not-certified" });
+
+    const unsafe = await mkdtemp(join(tmpdir(), "agentplugin-cert-high-"));
+    await writeFile(join(unsafe, "plugin.json"), JSON.stringify({ $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", name: "unsafe" }), "utf8");
+    await writeFile(join(unsafe, ".env"), "TOKEN=not-a-real-secret", "utf8");
+    const unsafeCap = capture();
+    expect(await runCli(["certify", unsafe, "--json"], { cwd: unsafe, ...unsafeCap.io })).toBe(1);
+    expect(JSON.parse(unsafeCap.stdout[0]!)).toMatchObject({ status: "not-certified" });
+  });
+
+  it("keeps medium findings non-blocking and gives definite high limit findings precedence over incompleteness", async () => {
+    const medium = await mkdtemp(join(tmpdir(), "agentplugin-cert-medium-"));
+    await writeFile(join(medium, "plugin.json"), JSON.stringify({ $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", name: "medium" }), "utf8");
+    await writeFile(join(medium, "tool.sh"), "echo safe", "utf8");
+    expect(await runCli(["certify", medium, "--json"], { cwd: medium, ...capture().io })).toBe(0);
+
+    const incomplete = await mkdtemp(join(tmpdir(), "agentplugin-cert-incomplete-"));
+    await writeFile(join(incomplete, "plugin.json"), JSON.stringify({ $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", name: "incomplete" }), "utf8");
+    await writeFile(join(incomplete, "large.txt"), "x".repeat(5_000_001), "utf8");
+    const cap = capture();
+    expect(await runCli(["certify", incomplete, "--json"], { cwd: incomplete, ...cap.io })).toBe(1);
+    expect(JSON.parse(cap.stdout[0]!)).toMatchObject({ status: "not-certified" });
+  });
+
+  it("uses exit code 2 for invalid certify usage", async () => {
+    const extra = capture();
+    expect(await runCli(["certify", ".", "extra", "--json"], extra.io)).toBe(2);
+    expect(JSON.parse(extra.stdout[0]!).error.code).toBe("USAGE_ERROR");
+    const option = capture();
+    expect(await runCli(["certify", "--profile", "x", "--json"], option.io)).toBe(2);
+    expect(JSON.parse(option.stdout[0]!).exitCode).toBe(2);
+  });
+
+  it("escapes control characters in human-readable certification evidence", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-cert-console-"));
+    await writeFile(join(cwd, "plugin.json"), JSON.stringify({
+      $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+      name: "console-safe"
+    }), "utf8");
+    await writeFile(join(cwd, "mcp.json"), JSON.stringify({
+      $schema: "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+      mcpServers: { "bad\nINJECTED": { type: "stdio", command: "node", env: { API_KEY: "literal-secret" } } }
+    }), "utf8");
+    const cap = capture();
+    expect(await runCli(["certify", cwd], { cwd, ...cap.io })).toBe(1);
+    expect(cap.stderr.some((message) => message.includes("\\u000aINJECTED"))).toBe(true);
+    expect(cap.stderr.every((message) => !message.includes("\n"))).toBe(true);
+    expect(cap.stderr.join(" ")).not.toContain("literal-secret");
+  });
+
+  it("does not expose raw parser exceptions or invalid package content during certification", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-cert-parser-"));
+    const secret = "literal-sensitive-parser-content";
+    await writeFile(join(cwd, "plugin.json"), `{\"token\":\"${secret}\",`, "utf8");
+    const cap = capture();
+    expect(await runCli(["certify", cwd, "--json"], { cwd, ...cap.io })).toBe(1);
+    expect(cap.stdout[0]).not.toContain(secret);
+    expect(cap.stdout[0]).not.toContain("Unexpected token");
   });
 
 });

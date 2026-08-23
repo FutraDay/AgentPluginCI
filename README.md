@@ -2,11 +2,11 @@
 
 Agent Plugin CI builds and validates portable Agent Plugins from real integration sources.
 
-> **v0.1 Developer Preview** — MCP ingestion, OpenAPI ingestion, deterministic `PluginIR` normalization, Agent Plugins 1.0 compilation, validation, security scanning, static compatibility testing, and a distribution-ready CLI.
+> **v0.1 Developer Preview** — MCP ingestion, OpenAPI ingestion, deterministic `PluginIR` normalization, Agent Plugins 1.0 compilation, validation, security scanning, static compatibility testing, static certification, and a distribution-ready CLI.
 
 The core architecture is intentionally fixed:
 
-`Source -> PluginIR -> Compiler -> Official Validation -> Security Scan -> Compatibility Testing -> Package`
+`Source -> PluginIR -> Compiler -> Official Validation -> Security Scan -> Compatibility Testing -> Certification -> Package`
 
 No source ingestion path compiles directly into `plugin.json`.
 
@@ -21,11 +21,12 @@ No source ingestion path compiles directly into `plugin.json`.
 - package validation from the CLI
 - deterministic package security scanning with stable findings and CI severity policy
 - versioned static compatibility profiles for Agent Plugins 1.0 portable core, Cursor, and VS Code/GitHub Copilot
+- deterministic static-portability certification over validation, security, and pinned compatibility evidence
 - machine-readable JSON results for CI
 - bundled npm CLI package
 - GitHub CI and tagged release packaging
 
-Markdown/docs/repository ingestion, runtime client adapters, compatibility matrices backed by runtime evidence, certification, hosted builds, and the web application are intentionally deferred until after v0.1.
+Markdown/docs/repository ingestion, runtime client adapters, compatibility matrices backed by runtime evidence, hosted builds, and the web application are intentionally deferred until after v0.1.
 
 ## Quick start
 
@@ -52,7 +53,7 @@ agentplugin --version
 
 The installed executable name is `agentplugin`.
 
-The published npm `0.1.0` package predates Phase 2I security scanning and Phase 2J compatibility testing. The `scan` and `compat` commands documented below are currently available from the repository build and will ship with a subsequent published CLI release.
+The published npm `0.1.0` package predates Phase 2I security scanning, Phase 2J compatibility testing, and Phase 2K certification. The `scan`, `compat`, and `certify` commands documented below are currently available from the repository build and will ship with a subsequent published CLI release.
 
 ## Build from MCP
 
@@ -115,15 +116,29 @@ node apps/cli/dist/index.cjs compat dist/support-api --all --json
 
 The default profile is `agent-plugins-1.0-portable-core`. Built-in client profiles are evidence-backed by first-party documentation for Cursor and VS Code/GitHub Copilot. Reports contain versioned profile and test IDs, bounded evidence, deterministic summaries, completeness, an explicit `static-inspection` evidence level, and `runtimeVerified: false`. Passing means statically eligible under the selected profile; client installation and MCP handshake evidence remain `not-assessed`, so the report never claims proven runtime interoperability. This phase confirms bounded, regular `skills/*/SKILL.md` discovery paths but does not validate `SKILL.md` document semantics, which is reported as a warning rather than silently treated as proven. Builds surface the portable-core result in report-only mode without changing successful build exit semantics.
 
+## Certify static portability
+
+Certification is a deterministic evidence aggregation layer. It calls the existing official validator, security scanner, and compatibility engine, then applies the versioned Phase 2K policy without duplicating those components' business logic.
+
+```powershell
+node apps/cli/dist/index.cjs certify dist/support-api
+node apps/cli/dist/index.cjs certify dist/support-api --json
+```
+
+The built-in policy pins the Phase 2J portable-core, Cursor, and VS Code/GitHub Copilot profiles at version `1.0.0`. Validation errors, high/critical security findings, or an ineligible required profile produce `not-certified`. Incomplete required evidence produces `unknown` unless another check has a definite failure. Validation warnings and medium/low/info security findings are retained as non-blocking evidence. Only `certified` exits with code `0`; `not-certified` and `unknown` exit with code `1`.
+
+Certification is static evidence only: `runtimeVerified` is always `false`, while client installation and MCP handshake remain `not-assessed`. A static certificate does not prove runtime interoperability.
+
 ## Machine-readable CI output
 
-Add `--json` to `build`, `validate`, `scan`, or `compat` to emit one JSON object on stdout.
+Add `--json` to `build`, `validate`, `scan`, `compat`, or `certify` to emit one JSON object on stdout.
 
 ```powershell
 node apps/cli/dist/index.cjs build --openapi fixtures/openapi/search.json --name search-api --out dist/search-api --json
 node apps/cli/dist/index.cjs validate dist/search-api --json
 node apps/cli/dist/index.cjs scan dist/search-api --json
 node apps/cli/dist/index.cjs compat dist/search-api --all --json
+node apps/cli/dist/index.cjs certify dist/search-api --json
 ```
 
 ## Output structure

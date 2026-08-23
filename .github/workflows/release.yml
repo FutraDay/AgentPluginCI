@@ -36,6 +36,7 @@ jobs:
           ./node_modules/.bin/agentplugin validate out --json
           ./node_modules/.bin/agentplugin scan out --json
           ./node_modules/.bin/agentplugin compat out --all --json
+          ./node_modules/.bin/agentplugin certify out --json
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
