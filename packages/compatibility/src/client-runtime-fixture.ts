@@ -78,6 +78,9 @@ function successOutput(evidence: ClientRuntimeAdapterOutput["evidence"]): Client
     complete: true,
     packageInstall: "observed",
     clientLoad: "observed",
+    mcpStartup: "not-assessed",
+    mcpHandshake: "not-assessed",
+    toolExposure: "not-assessed",
     interoperability: "not-established",
     targetClientVersion: "0.0.0-fixture",
     evidence

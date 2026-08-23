@@ -28,7 +28,7 @@ describe("client runtime harness", () => {
     expect(() => new ClientRuntimeAdapterRegistry([sensitiveMetadata])).toThrow(InvalidClientRuntimeAdapterError);
     expect(KNOWN_CLIENT_RUNTIME_TARGETS).toEqual([
       { id: "cursor", name: "Cursor", adapterAvailable: false },
-      { id: "vscode-github-copilot", name: "VS Code/GitHub Copilot", adapterAvailable: false }
+      { id: "vscode-github-copilot", name: "VS Code/GitHub Copilot", adapterAvailable: true }
     ]);
     expect(registry.list().some((item) => item.targetClient.id === "cursor" || item.targetClient.id === "vscode-github-copilot"))
       .toBe(false);
@@ -44,6 +44,9 @@ describe("client runtime harness", () => {
       execution: { status: "denied", complete: false, finalize: "not-run" },
       packageInstall: "not-assessed",
       clientLoad: "not-assessed",
+      mcpStartup: "not-assessed",
+      mcpHandshake: "not-assessed",
+      toolExposure: "not-assessed",
       interoperability: "not-established"
     });
     expect(JSON.stringify(report)).toContain("APCI-CLIENT-POLICY-001");
@@ -141,7 +144,7 @@ describe("client runtime harness", () => {
     const second = await runClientRuntimeHarness("package", createSyntheticFixtureClientAdapter(), { allowExecution: true });
     expect(events).toEqual(["initialize", "execute", "finalize:pass"]);
     expect(first).toMatchObject({
-      schemaVersion: "1.0.0",
+      schemaVersion: "1.1.0",
       evidenceLevel: "client-runtime-observation",
       scope: "client-adapter-harness",
       synthetic: true,
@@ -150,6 +153,9 @@ describe("client runtime harness", () => {
       execution: { status: "pass", complete: true, finalize: "complete" },
       packageInstall: "observed",
       clientLoad: "observed",
+      mcpStartup: "not-assessed",
+      mcpHandshake: "not-assessed",
+      toolExposure: "not-assessed",
       interoperability: "not-established"
     });
     expect(first.note).toContain("does not establish interoperability with any real client");
@@ -168,6 +174,9 @@ describe("client runtime harness", () => {
       execution: { status: "timeout", complete: false, finalize: "complete" },
       packageInstall: "unknown",
       clientLoad: "unknown",
+      mcpStartup: "unknown",
+      mcpHandshake: "unknown",
+      toolExposure: "unknown",
       interoperability: "not-established"
     });
     expect(JSON.stringify(report)).toContain("APCI-CLIENT-LIFECYCLE-002");
@@ -224,6 +233,9 @@ describe("client runtime harness", () => {
       execution: { status: "unknown", complete: false, finalize: "complete" },
       packageInstall: "unknown",
       clientLoad: "unknown",
+      mcpStartup: "unknown",
+      mcpHandshake: "unknown",
+      toolExposure: "unknown",
       interoperability: "not-established"
     });
     expect(JSON.stringify(report)).toContain("APCI-CLIENT-OUTPUT-001");
@@ -283,6 +295,9 @@ function output(evidence = [{ code: "APCI-CLIENT-TEST-001", location: "test", su
     complete: true,
     packageInstall: "observed",
     clientLoad: "observed",
+    mcpStartup: "not-assessed",
+    mcpHandshake: "not-assessed",
+    toolExposure: "not-assessed",
     interoperability: "established",
     evidence
   } as const;

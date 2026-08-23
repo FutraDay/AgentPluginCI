@@ -480,7 +480,87 @@ describe("Agent Plugin CI CLI", () => {
     expect(await runCli(fixtureArgs, { cwd, ...textCap.io })).toBe(0);
     expect(textCap.stdout.some((line) => line.startsWith("CLIENT_RUNTIME_PASS"))).toBe(true);
     expect(textCap.stdout).toContain("CLIENT_RUNTIME_SCOPE client-adapter-harness complete=true synthetic=true interoperability=not-established");
-    expect(textCap.stdout).toContain("CLIENT_OBSERVATIONS install=observed load=observed finalize=complete");
+    expect(textCap.stdout).toContain(
+      "CLIENT_OBSERVATIONS install=observed load=observed mcp-startup=not-assessed mcp-handshake=not-assessed tool-exposure=not-assessed finalize=complete"
+    );
+  });
+
+  it("lists the real VS Code adapter and its explicit executable/capability gates in help", async () => {
+    const cap = capture();
+    expect(await runCli(["--help"], cap.io)).toBe(0);
+    const help = cap.stdout.join("\n");
+    expect(help).toContain("vscode-github-copilot");
+    expect(help).toContain("--client-executable <path>");
+    expect(help).toContain("--allow-client-package-read");
+    expect(help).toContain("--allow-client-process");
+    expect(help).toContain("--allow-client-filesystem");
+    expect(help).toContain("--allow-client-network");
+    expect(help).toContain("MCP disabled");
+  });
+
+  it("requires a bounded absolute executable path for the VS Code adapter", async () => {
+    const missing = capture();
+    expect(await runCli([
+      "compat-runtime", ".", "--client-adapter", "vscode-github-copilot", "--json"
+    ], missing.io)).toBe(2);
+    expect(JSON.parse(missing.stdout[0]!)).toMatchObject({
+      error: { code: "USAGE_ERROR", message: expect.stringContaining("--client-executable") },
+      exitCode: 2
+    });
+
+    const relative = capture();
+    expect(await runCli([
+      "compat-runtime", ".", "--client-adapter", "vscode-github-copilot",
+      "--client-executable", "relative-code.exe", "--json"
+    ], relative.io)).toBe(2);
+    expect(JSON.parse(relative.stdout[0]!).error.message).toContain("absolute executable path");
+  });
+
+  it("denies the real adapter unless every declared capability is explicitly granted", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-client-vscode-denied-cli-"));
+    await writeFile(join(cwd, "plugin.json"), JSON.stringify({
+      $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", name: "client-vscode-denied-cli"
+    }), "utf8");
+    const cap = capture();
+    expect(await runCli([
+      "compat-runtime", cwd,
+      "--client-adapter", "vscode-github-copilot",
+      "--client-executable", process.execPath,
+      "--allow-client-runtime",
+      "--allow-client-package-read",
+      "--allow-client-process",
+      "--allow-client-filesystem",
+      "--json"
+    ], { cwd, ...cap.io })).toBe(1);
+    expect(JSON.parse(cap.stdout[0]!)).toMatchObject({
+      ok: false,
+      synthetic: false,
+      adapter: { id: "vscode-github-copilot" },
+      requestedCapabilities: ["client-filesystem", "client-process", "network", "package-read"],
+      grantedCapabilities: ["client-filesystem", "client-process", "package-read"],
+      execution: { status: "denied", complete: false, finalize: "not-run" },
+      packageInstall: "not-assessed",
+      clientLoad: "not-assessed",
+      mcpStartup: "not-assessed",
+      mcpHandshake: "not-assessed",
+      toolExposure: "not-assessed",
+      interoperability: "not-established"
+    });
+  });
+
+  it("keeps the synthetic fixture at zero capabilities and rejects stray client opt-ins", async () => {
+    const synthetic = capture();
+    expect(await runCli([
+      "compat-runtime", ".", "--client-adapter", "synthetic-fixture",
+      "--allow-client-runtime", "--allow-synthetic-fixture", "--allow-client-process", "--json"
+    ], synthetic.io)).toBe(2);
+    expect(JSON.parse(synthetic.stdout[0]!).error.message).toContain("accepts no executable path or client capability grants");
+
+    const noAdapter = capture();
+    expect(await runCli([
+      "compat-runtime", ".", "--client-executable", process.execPath, "--json"
+    ], noAdapter.io)).toBe(2);
+    expect(JSON.parse(noAdapter.stdout[0]!).error.message).toContain("require --client-adapter");
   });
 
   it("keeps client adapter execution and the synthetic fixture deny-by-default", async () => {

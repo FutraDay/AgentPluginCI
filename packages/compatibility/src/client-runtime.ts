@@ -1,4 +1,4 @@
-export const CLIENT_RUNTIME_REPORT_SCHEMA_VERSION = "1.0.0";
+export const CLIENT_RUNTIME_REPORT_SCHEMA_VERSION = "1.1.0";
 export const CLIENT_RUNTIME_EVIDENCE_LEVEL = "client-runtime-observation" as const;
 export const CLIENT_RUNTIME_SCOPE = "client-adapter-harness" as const;
 
@@ -32,7 +32,7 @@ export const KNOWN_CLIENT_RUNTIME_TARGETS = Object.freeze([
   Object.freeze({
     id: VSCODE_COPILOT_CLIENT_RUNTIME_TARGET_ID,
     name: "VS Code/GitHub Copilot",
-    adapterAvailable: false as const
+    adapterAvailable: true as const
   })
 ]);
 
@@ -79,6 +79,9 @@ export interface ClientRuntimeAdapterOutput {
   complete: boolean;
   packageInstall: ClientRuntimeObservationStatus;
   clientLoad: ClientRuntimeObservationStatus;
+  mcpStartup: ClientRuntimeObservationStatus;
+  mcpHandshake: ClientRuntimeObservationStatus;
+  toolExposure: ClientRuntimeObservationStatus;
   interoperability: ClientRuntimeInteroperability;
   targetClientVersion?: string;
   evidence: readonly ClientRuntimeEvidence[];
@@ -119,6 +122,9 @@ export interface ClientRuntimeReport {
   };
   packageInstall: ClientRuntimeObservationStatus;
   clientLoad: ClientRuntimeObservationStatus;
+  mcpStartup: ClientRuntimeObservationStatus;
+  mcpHandshake: ClientRuntimeObservationStatus;
+  toolExposure: ClientRuntimeObservationStatus;
   interoperability: ClientRuntimeInteroperability;
   evidence: ClientRuntimeEvidence[];
   note: string;
@@ -273,7 +279,10 @@ export async function runClientRuntimeHarness(
     normalized?.clientLoad ?? "unknown",
     [...evidenceItems, ...finalizeEvidence],
     interoperability,
-    normalized?.targetClientVersion
+    normalized?.targetClientVersion,
+    normalized?.mcpStartup ?? "unknown",
+    normalized?.mcpHandshake ?? "unknown",
+    normalized?.toolExposure ?? "unknown"
   );
 }
 
@@ -319,7 +328,9 @@ function normalizeAdapterOutput(raw: unknown): ClientRuntimeAdapterOutput {
   try {
     if (!isRecord(raw)) throw new Error();
     if (!isExecutionResult(raw.status) || typeof raw.complete !== "boolean") throw new Error();
-    if (!isObservation(raw.packageInstall) || !isObservation(raw.clientLoad)) throw new Error();
+    if (!isObservation(raw.packageInstall) || !isObservation(raw.clientLoad)
+      || !isObservation(raw.mcpStartup) || !isObservation(raw.mcpHandshake)
+      || !isObservation(raw.toolExposure)) throw new Error();
     if (raw.interoperability !== "established" && raw.interoperability !== "not-established") throw new Error();
     if (raw.targetClientVersion !== undefined && !safeVersion(raw.targetClientVersion)) throw new Error();
     if (!Array.isArray(raw.evidence) || raw.evidence.length > MAX_EVIDENCE_INPUT_ITEMS) throw new Error();
@@ -329,6 +340,9 @@ function normalizeAdapterOutput(raw: unknown): ClientRuntimeAdapterOutput {
       complete: raw.complete,
       packageInstall: raw.packageInstall,
       clientLoad: raw.clientLoad,
+      mcpStartup: raw.mcpStartup,
+      mcpHandshake: raw.mcpHandshake,
+      toolExposure: raw.toolExposure,
       interoperability: raw.interoperability,
       ...(raw.targetClientVersion ? { targetClientVersion: raw.targetClientVersion } : {}),
       evidence: boundedEvidence(items)
@@ -383,7 +397,10 @@ function baseReport(
   clientLoad: ClientRuntimeObservationStatus,
   items: ClientRuntimeEvidence[],
   interoperability: ClientRuntimeInteroperability = "not-established",
-  targetClientVersion?: string
+  targetClientVersion?: string,
+  mcpStartup: ClientRuntimeObservationStatus = "not-assessed",
+  mcpHandshake: ClientRuntimeObservationStatus = "not-assessed",
+  toolExposure: ClientRuntimeObservationStatus = "not-assessed"
 ): ClientRuntimeReport {
   const targetClient = {
     ...metadata.targetClient,
@@ -401,6 +418,9 @@ function baseReport(
     execution: { status, complete, finalize },
     packageInstall,
     clientLoad,
+    mcpStartup,
+    mcpHandshake,
+    toolExposure,
     interoperability,
     evidence: boundedEvidence(items),
     note: metadata.synthetic

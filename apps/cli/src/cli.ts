@@ -7,10 +7,13 @@ import {
   BUILT_IN_COMPATIBILITY_PROFILES,
   ClientRuntimeAdapterRegistry,
   createSyntheticFixtureClientAdapter,
+  createVscodeClientRuntimeAdapter,
   PORTABLE_CORE_PROFILE_ID,
   runClientRuntimeHarness,
   UnknownClientRuntimeAdapterError,
   UnknownCompatibilityProfileError,
+  VSCODE_CLIENT_RUNTIME_ADAPTER_ID,
+  type ClientRuntimeCapability,
   type ClientRuntimeReport,
   type CompatibilitySuiteReport,
   type RuntimeCompatibilityOptions,
@@ -37,7 +40,6 @@ import cliPackage from "../package.json" with { type: "json" };
 
 export const CLI_VERSION = cliPackage.version;
 const MAX_JSON_BYTES = 1_000_000;
-const CLI_CLIENT_ADAPTERS = new ClientRuntimeAdapterRegistry([createSyntheticFixtureClientAdapter()]);
 
 export interface CliIo {
   cwd?: string;
@@ -291,13 +293,14 @@ async function runCompatRuntime(
   }
   const packageDir = info.isDirectory() ? resolved : dirname(resolved);
   if (client) {
+    const adapters = createCliClientAdapterRegistry(client.executablePath, options.timeoutMs);
     let adapter;
     try {
-      adapter = CLI_CLIENT_ADAPTERS.get(client.adapterId);
+      adapter = adapters.get(client.adapterId);
     } catch (error) {
       if (error instanceof UnknownClientRuntimeAdapterError) {
         throw new CliError(
-          `${error.message}. Available adapters: ${CLI_CLIENT_ADAPTERS.list().map((item) => item.adapter.id).join(", ")}`,
+          `${error.message}. Available adapters: ${adapters.list().map((item) => item.adapter.id).join(", ")}`,
           "USAGE_ERROR",
           2
         );
@@ -313,6 +316,7 @@ async function runCompatRuntime(
     }
     const report = await runClientRuntimeHarness(packageDir, adapter, {
       allowExecution: client.allowExecution,
+      grantedCapabilities: client.grantedCapabilities,
       ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {})
     });
     const ok = report.execution.status === "pass" && report.execution.complete;
@@ -496,7 +500,13 @@ function parseCompatRuntimeArgs(args: string[]): {
   target: string;
   json: boolean;
   options: RuntimeCompatibilityOptions;
-  client?: { adapterId: string; allowExecution: boolean; allowSyntheticFixture: boolean };
+  client?: {
+    adapterId: string;
+    allowExecution: boolean;
+    allowSyntheticFixture: boolean;
+    executablePath?: string;
+    grantedCapabilities: ClientRuntimeCapability[];
+  };
 } {
   let target = ".";
   let seenTarget = false;
@@ -505,6 +515,8 @@ function parseCompatRuntimeArgs(args: string[]): {
   let clientAdapterId: string | undefined;
   let allowClientRuntime = false;
   let allowSyntheticFixture = false;
+  let clientExecutable: string | undefined;
+  const grantedCapabilities = new Set<ClientRuntimeCapability>();
   const options: RuntimeCompatibilityOptions = {};
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!;
@@ -514,6 +526,20 @@ function parseCompatRuntimeArgs(args: string[]): {
     if (arg === "--allow-insecure-http") { options.allowInsecureHttp = true; continue; }
     if (arg === "--allow-client-runtime") { allowClientRuntime = true; continue; }
     if (arg === "--allow-synthetic-fixture") { allowSyntheticFixture = true; continue; }
+    if (arg === "--allow-client-package-read") { grantedCapabilities.add("package-read"); continue; }
+    if (arg === "--allow-client-process") { grantedCapabilities.add("client-process"); continue; }
+    if (arg === "--allow-client-filesystem") { grantedCapabilities.add("client-filesystem"); continue; }
+    if (arg === "--allow-client-network") { grantedCapabilities.add("network"); continue; }
+    if (arg === "--client-executable") {
+      const value = args[++index];
+      if (!value || value.startsWith("--")) throw new CliError("--client-executable requires an absolute executable path", "USAGE_ERROR", 2);
+      if (clientExecutable !== undefined) throw new CliError("--client-executable may only be provided once", "USAGE_ERROR", 2);
+      if (!isAbsolute(value) || value.length > 4_096 || /[\u0000-\u001f\u007f]/.test(value)) {
+        throw new CliError("--client-executable requires a bounded absolute executable path", "USAGE_ERROR", 2);
+      }
+      clientExecutable = value;
+      continue;
+    }
     if (arg === "--client-adapter") {
       const value = args[++index];
       if (!value || value.startsWith("--")) throw new CliError("--client-adapter requires an adapter id", "USAGE_ERROR", 2);
@@ -538,17 +564,51 @@ function parseCompatRuntimeArgs(args: string[]): {
     if (options.allowStdioRuntime || options.allowPrivateNetwork || options.allowInsecureHttp) {
       throw new CliError("MCP runtime permission options cannot be combined with --client-adapter", "USAGE_ERROR", 2);
     }
+    if (clientAdapterId === VSCODE_CLIENT_RUNTIME_ADAPTER_ID && clientExecutable === undefined) {
+      throw new CliError(
+        "The vscode-github-copilot adapter requires --client-executable with an absolute VS Code executable path",
+        "USAGE_ERROR",
+        2
+      );
+    }
+    if (clientAdapterId === "synthetic-fixture"
+      && (clientExecutable !== undefined || grantedCapabilities.size > 0)) {
+      throw new CliError(
+        "The synthetic-fixture adapter accepts no executable path or client capability grants",
+        "USAGE_ERROR",
+        2
+      );
+    }
     return {
       target,
       json,
       options,
-      client: { adapterId: clientAdapterId, allowExecution: allowClientRuntime, allowSyntheticFixture }
+      client: {
+        adapterId: clientAdapterId,
+        allowExecution: allowClientRuntime,
+        allowSyntheticFixture,
+        ...(clientExecutable ? { executablePath: clientExecutable } : {}),
+        grantedCapabilities: [...grantedCapabilities]
+      }
     };
   }
-  if (allowClientRuntime || allowSyntheticFixture) {
+  if (allowClientRuntime || allowSyntheticFixture || clientExecutable !== undefined || grantedCapabilities.size > 0) {
     throw new CliError("Client runtime opt-ins require --client-adapter", "USAGE_ERROR", 2);
   }
   return { target, json, options };
+}
+
+function createCliClientAdapterRegistry(
+  executablePath?: string,
+  timeoutMs = 5_000
+): ClientRuntimeAdapterRegistry {
+  return new ClientRuntimeAdapterRegistry([
+    createSyntheticFixtureClientAdapter(),
+    createVscodeClientRuntimeAdapter({
+      executablePath: executablePath ?? "",
+      observationWindowMs: Math.max(100, Math.min(20_000, timeoutMs - 2_500))
+    })
+  ]);
 }
 
 function parseCertifyArgs(args: string[]): { target: string; json: boolean } {
@@ -896,7 +956,7 @@ function renderClientRuntimeCompatibility(
   write(`CLIENT_RUNTIME_SCOPE ${payload.scope} complete=${payload.execution.complete} synthetic=${payload.synthetic} interoperability=${payload.interoperability}`);
   write(`CLIENT_ADAPTER ${payload.adapter.id}@${payload.adapter.version}`);
   write(`TARGET_CLIENT ${payload.targetClient.id}${payload.targetClient.version ? `@${payload.targetClient.version}` : "@unknown"}`);
-  write(`CLIENT_OBSERVATIONS install=${payload.packageInstall} load=${payload.clientLoad} finalize=${payload.execution.finalize}`);
+  write(`CLIENT_OBSERVATIONS install=${payload.packageInstall} load=${payload.clientLoad} mcp-startup=${payload.mcpStartup} mcp-handshake=${payload.mcpHandshake} tool-exposure=${payload.toolExposure} finalize=${payload.execution.finalize}`);
   for (const item of payload.evidence) write(`[${item.code}] ${sanitizeConsoleText(item.summary)}`);
   write(`NOTE ${sanitizeConsoleText(payload.note)}`);
 }
@@ -1015,8 +1075,13 @@ Runtime compatibility options:
   --allow-private-network         Permit private-network remote MCP runtime targets
   --allow-insecure-http           Permit insecure HTTP remote MCP runtime targets
   --timeout-ms <100-30000>        MCP initialize or client lifecycle timeout (default: 5000)
-  --client-adapter <id>           Use a client harness adapter (only synthetic-fixture is currently available)
+  --client-adapter <id>           Use synthetic-fixture or real vscode-github-copilot load adapter (MCP disabled)
+  --client-executable <path>      Required absolute VS Code executable path for vscode-github-copilot
   --allow-client-runtime          Explicitly permit the selected client adapter lifecycle
+  --allow-client-package-read     Grant the selected adapter bounded package-root read access
+  --allow-client-process          Grant the selected adapter direct client process execution
+  --allow-client-filesystem       Grant isolated client state/log filesystem access
+  --allow-client-network          Grant possible client network access (required for VS Code fail-closed gating)
   --allow-synthetic-fixture       Permit the synthetic-fixture test adapter (never real evidence)
   --json                          Emit bounded MCP or client-runtime evidence as JSON
 
@@ -1030,7 +1095,7 @@ Exit codes:
   1  Build, input, security, validation, compatibility, or certification failure/unknown
   2  Invalid CLI usage
 
-Security defaults are deny-by-default for stdio and client-adapter execution,
+Security defaults are deny-by-default for stdio and client-adapter execution/capabilities,
 synthetic fixtures, private-network access, insecure HTTP, cross-origin OpenAPI refs,
 and external file refs.`;
 }

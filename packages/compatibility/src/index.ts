@@ -735,3 +735,4 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export * from "./runtime.js";
 export * from "./client-runtime.js";
 export * from "./client-runtime-fixture.js";
+export * from "./client-runtime-vscode.js";
