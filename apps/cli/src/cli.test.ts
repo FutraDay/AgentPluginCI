@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { ClientRuntimeAdapterRegistry, type ClientRuntimeAdapter } from "@agent-plugin-ci/compatibility";
 import { runCli } from "./cli.js";
 
 const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
@@ -11,6 +12,50 @@ function capture() {
   const stdout: string[] = [];
   const stderr: string[] = [];
   return { stdout, stderr, io: { stdout: (m: string) => stdout.push(m), stderr: (m: string) => stderr.push(m) } };
+}
+
+const runtimeCertificationFlags = [
+  "--client-adapter", "vscode-github-copilot",
+  "--client-executable", process.execPath,
+  "--allow-client-runtime",
+  "--allow-client-mcp-runtime",
+  "--allow-client-package-read",
+  "--allow-client-process",
+  "--allow-client-filesystem",
+  "--allow-client-network"
+];
+
+function runtimeCertificationRegistry(onLifecycle?: () => void): ClientRuntimeAdapterRegistry {
+  const adapter: ClientRuntimeAdapter = {
+    metadata: {
+      adapter: { id: "vscode-github-copilot", version: "1.5.0-test" },
+      targetClient: { id: "vscode-github-copilot", name: "VS Code/GitHub Copilot" },
+      synthetic: false,
+      requiredCapabilities: ["package-read", "client-process", "client-filesystem", "network"]
+    },
+    execute() {
+      onLifecycle?.();
+      return {
+        status: "pass",
+        complete: true,
+        packageInstall: "not-observed",
+        clientLoad: "observed",
+        mcpStartup: "observed",
+        mcpHandshake: "observed",
+        toolExposure: "observed",
+        toolInvocation: "observed",
+        interoperability: "scoped-established",
+        targetClientVersion: "1.105.1",
+        evidence: [{
+          code: "APCI-CLIENT-CLI-001",
+          location: "client-runtime/test",
+          summary: "Observed the bounded MCP tool path."
+        }]
+      };
+    },
+    finalize() {}
+  };
+  return new ClientRuntimeAdapterRegistry([adapter]);
 }
 
 describe("Agent Plugin CI CLI", () => {
@@ -423,6 +468,131 @@ describe("Agent Plugin CI CLI", () => {
     expect(await runCli(["certify", cwd, "--json"], { cwd, ...cap.io })).toBe(1);
     expect(cap.stdout[0]).not.toContain(secret);
     expect(cap.stdout[0]).not.toContain("Unexpected token");
+  });
+
+  it("produces positive scoped runtime certification without requiring package installation observation", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-cert-runtime-"));
+    const out = join(cwd, "out");
+    expect(await runCli([
+      "build", "--ir", join(repoRoot, "fixtures/hello/plugin-ir.json"), "--out", out
+    ], { cwd, ...capture().io })).toBe(0);
+    let lifecycleCalls = 0;
+    const factoryTimeouts: number[] = [];
+    const factory = (options: { executablePath: string; timeoutMs: number; allowMcpRuntime: boolean }) => {
+      factoryTimeouts.push(options.timeoutMs);
+      return runtimeCertificationRegistry(() => { lifecycleCalls += 1; });
+    };
+
+    const jsonCap = capture();
+    expect(await runCli([
+      "certify-runtime", out, ...runtimeCertificationFlags, "--json"
+    ], { cwd, ...jsonCap.io, clientRuntimeAdapterRegistryFactory: factory })).toBe(0);
+    expect(JSON.parse(jsonCap.stdout[0]!)).toMatchObject({
+      ok: true,
+      command: "certify-runtime",
+      status: "certified",
+      scope: "named-client-version-mcp-tool-path",
+      targetClient: { id: "vscode-github-copilot", version: "1.105.1" },
+      adapter: { id: "vscode-github-copilot", synthetic: false },
+      execution: { status: "pass", complete: true, finalize: "complete" },
+      packageInstall: "not-observed",
+      clientLoad: "observed",
+      mcpStartup: "observed",
+      mcpHandshake: "observed",
+      toolExposure: "observed",
+      toolInvocation: "observed",
+      interoperability: "scoped-established",
+      interoperabilityScope: "named-client-version-mcp-tool-path"
+    });
+    expect(jsonCap.stdout[0]).toContain("other-client interoperability");
+
+    const textCap = capture();
+    expect(await runCli([
+      "certify-runtime", join(out, "plugin.json"), ...runtimeCertificationFlags
+    ], { cwd, ...textCap.io, clientRuntimeAdapterRegistryFactory: factory })).toBe(0);
+    expect(textCap.stdout).toContain("RUNTIME_CERTIFICATION_SCOPE named-client-version-mcp-tool-path");
+    expect(textCap.stdout).toContain("TARGET_CLIENT vscode-github-copilot@1.105.1 name=VS Code/GitHub Copilot");
+    expect(textCap.stdout).toContain("PACKAGE_INSTALL not-observed required=false");
+    expect(textCap.stdout.some((line) => line.includes("other-client interoperability"))).toBe(true);
+    expect(lifecycleCalls).toBe(2);
+    expect(factoryTimeouts).toEqual([30_000, 30_000]);
+  });
+
+  it("collects static evidence first and does not launch a client when static certification fails", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agentplugin-cert-runtime-static-fail-"));
+    await writeFile(join(cwd, "plugin.json"), JSON.stringify({ name: "invalid-static-package" }), "utf8");
+    let registryCalls = 0;
+    let lifecycleCalls = 0;
+    const cap = capture();
+    expect(await runCli([
+      "certify-runtime", cwd, ...runtimeCertificationFlags, "--json"
+    ], {
+      cwd,
+      ...cap.io,
+      clientRuntimeAdapterRegistryFactory: () => {
+        registryCalls += 1;
+        return runtimeCertificationRegistry(() => { lifecycleCalls += 1; });
+      }
+    })).toBe(1);
+    expect(registryCalls).toBe(0);
+    expect(lifecycleCalls).toBe(0);
+    expect(JSON.parse(cap.stdout[0]!)).toMatchObject({
+      ok: false,
+      command: "certify-runtime",
+      status: "not-certified",
+      scope: "none",
+      staticCertification: { status: "not-certified" },
+      clientRuntimeSchemaVersion: "invalid",
+      execution: { status: "invalid", complete: false, finalize: "invalid" },
+      packageInstall: "not-assessed"
+    });
+  });
+
+  it("requires the real adapter, executable, lifecycle and MCP opt-ins, and exact capability grants", async () => {
+    const cases: Array<{ args: string[]; message: string }> = [
+      { args: ["certify-runtime", ".", "--json"], message: "requires --client-adapter" },
+      {
+        args: [
+          "certify-runtime", ".", "--client-adapter", "vscode-github-copilot",
+          "--client-executable", process.execPath, "--allow-client-mcp-runtime", "--json"
+        ],
+        message: "also requires --allow-client-runtime"
+      },
+      {
+        args: [
+          "certify-runtime", ".", "--client-adapter", "vscode-github-copilot",
+          "--client-executable", process.execPath, "--allow-client-runtime", "--json"
+        ],
+        message: "requires explicit --allow-client-mcp-runtime"
+      },
+      {
+        args: ["certify-runtime", ".", ...runtimeCertificationFlags.filter((item) => item !== "--allow-client-network"), "--json"],
+        message: "requires exact capability grants"
+      },
+      {
+        args: [
+          "certify-runtime", ".", "--client-adapter", "synthetic-fixture",
+          "--allow-client-runtime", "--allow-synthetic-fixture", "--json"
+        ],
+        message: "requires --client-adapter vscode-github-copilot"
+      }
+    ];
+    for (const testCase of cases) {
+      const cap = capture();
+      expect(await runCli(testCase.args, cap.io)).toBe(2);
+      expect(JSON.parse(cap.stdout[0]!).error.message).toContain(testCase.message);
+    }
+  });
+
+  it("documents the separate scoped runtime certification command and its non-claims", async () => {
+    const cap = capture();
+    expect(await runCli(["--help"], cap.io)).toBe(0);
+    const help = cap.stdout.join("\n");
+    expect(help).toContain("agentplugin certify-runtime");
+    expect(help).toContain("named-client-version-mcp-tool-path");
+    expect(help).toContain("Package installation is reported separately and is not required");
+    expect(help).toContain("other-client interoperability");
+    expect(help).toContain("other-tool");
   });
 
   it("runs explicit MCP runtime compatibility with stdio opt-in", async () => {

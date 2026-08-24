@@ -197,16 +197,22 @@ describe("runtime compatibility evidence", () => {
       "utf8"
     );
     await writeMcp(root, {
-      fixture: { type: "stdio", command: "node", args: [localFixture] }
+      fixture: { type: "stdio", command: "node", args: [localFixture], cwd: "${PLUGIN_ROOT}" }
     });
-    await expect(preflightSingleClientMcpStdioTarget(root)).resolves.toEqual({
+    await expect(preflightSingleClientMcpStdioTarget(root)).resolves.toMatchObject({
       ok: true,
-      target: { name: "fixture", location: "mcp.json/mcpServers/fixture" }
+      target: {
+        name: "fixture",
+        location: "mcp.json/mcpServers/fixture",
+        command: "node",
+        args: [localFixture],
+        mcpSchema: MCP_SCHEMA
+      }
     });
     expect(await exists(marker)).toBe(false);
   });
 
-  it("rejects ambiguous, remote, cwd-bearing, and environment-bearing client MCP targets", async () => {
+  it("rejects ambiguous, remote, unsupported-cwd-bearing, and environment-bearing client MCP targets", async () => {
     const cases: Array<{ servers: Record<string, unknown>; code: string }> = [
       {
         servers: {
@@ -222,6 +228,18 @@ describe("runtime compatibility evidence", () => {
       {
         servers: { cwd: { type: "stdio", command: "node", cwd: "." } },
         code: "APCI-RUNTIME-INPUT-003"
+      },
+      {
+        servers: { cwdPluginData: { type: "stdio", command: "node", cwd: "${PLUGIN_DATA}" } },
+        code: "APCI-RUNTIME-BOUND-003"
+      },
+      {
+        servers: { cwdPluginSubdir: { type: "stdio", command: "node", cwd: "${PLUGIN_ROOT}/subdir" } },
+        code: "APCI-RUNTIME-BOUND-003"
+      },
+      {
+        servers: { cwdRelative: { type: "stdio", command: "node", cwd: "./" } },
+        code: "APCI-RUNTIME-BOUND-003"
       },
       {
         servers: { env: { type: "stdio", command: "node", env: { TOKEN: "${TOKEN}" } } },

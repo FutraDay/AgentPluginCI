@@ -13,6 +13,7 @@ import {
   UnknownClientRuntimeAdapterError,
   UnknownCompatibilityProfileError,
   VSCODE_CLIENT_RUNTIME_ADAPTER_ID,
+  VSCODE_CLIENT_RUNTIME_REQUIRED_CAPABILITIES,
   type ClientRuntimeCapability,
   type ClientRuntimeReport,
   type CompatibilitySuiteReport,
@@ -21,8 +22,10 @@ import {
 } from "@agent-plugin-ci/compatibility";
 import {
   certifyPluginEvidence,
+  certifyRuntimeEvidence,
   STATIC_PORTABILITY_POLICY,
-  type CertificationReport
+  type CertificationReport,
+  type RuntimeCertificationReport
 } from "@agent-plugin-ci/certification";
 import { compilePlugin, type CompiledPlugin } from "@agent-plugin-ci/compiler";
 import { createSdkMcpToolDiscoverer, ingestMcpConfig, mcpConfigFromUrl } from "@agent-plugin-ci/ingest-mcp";
@@ -45,11 +48,18 @@ export interface CliIo {
   cwd?: string;
   stdout?: (message: string) => void;
   stderr?: (message: string) => void;
+  /** Trusted in-process test/integration seam; never configurable from CLI input. */
+  clientRuntimeAdapterRegistryFactory?: (options: {
+    executablePath: string;
+    timeoutMs: number;
+    allowMcpRuntime: boolean;
+  }) => ClientRuntimeAdapterRegistry;
 }
 
 type SourceKind = "mcp" | "openapi" | "ir";
 type ScanThreshold = SecuritySeverity | "none";
 type Warning = { code: string; message: string; scope?: string };
+const DEFAULT_CLIENT_RUNTIME_TIMEOUT_MS = 30_000;
 
 type ParsedBuildOptions = {
   sourceKind: SourceKind;
@@ -93,6 +103,9 @@ export async function runCli(rawArgs: string[], io: CliIo = {}): Promise<number>
     if (args[0] === "compat") return await runCompat(args.slice(1), cwd, stdout, stderr);
     if (args[0] === "compat-runtime") return await runCompatRuntime(args.slice(1), cwd, stdout, stderr);
     if (args[0] === "certify") return await runCertify(args.slice(1), cwd, stdout, stderr);
+    if (args[0] === "certify-runtime") {
+      return await runCertifyRuntime(args.slice(1), cwd, stdout, stderr, io.clientRuntimeAdapterRegistryFactory);
+    }
     throw new CliError(`Unknown command: ${args[0]}`, "USAGE_ERROR", 2);
   } catch (error) {
     return renderFailure(error, json, stdout, stderr);
@@ -293,9 +306,10 @@ async function runCompatRuntime(
   }
   const packageDir = info.isDirectory() ? resolved : dirname(resolved);
   if (client) {
+    const clientTimeoutMs = options.timeoutMs ?? DEFAULT_CLIENT_RUNTIME_TIMEOUT_MS;
     const adapters = createCliClientAdapterRegistry(
       client.executablePath,
-      options.timeoutMs,
+      clientTimeoutMs,
       client.allowMcpRuntime
     );
     let adapter;
@@ -321,7 +335,7 @@ async function runCompatRuntime(
     const report = await runClientRuntimeHarness(packageDir, adapter, {
       allowExecution: client.allowExecution,
       grantedCapabilities: client.grantedCapabilities,
-      ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {})
+      timeoutMs: clientTimeoutMs
     });
     const ok = report.execution.status === "pass" && report.execution.complete;
     const payload = { ok, command: "compat-runtime", version: CLI_VERSION, target: packageDir, ...report };
@@ -355,16 +369,82 @@ async function runCertify(
   if (!packageInfo?.isDirectory() || packageInfo.isSymbolicLink()) {
     throw new CliError("Certification package root must be a regular directory", "CERTIFICATION_INPUT_ERROR");
   }
+  const report = await collectStaticCertification(packageDir);
+  const payload = { ok: report.status === "certified", command: "certify", version: CLI_VERSION, target: packageDir, ...report };
+  if (json) stdout(JSON.stringify(payload));
+  else renderCertification(payload, stdout, stderr);
+  return payload.ok ? 0 : 1;
+}
+
+async function collectStaticCertification(packageDir: string): Promise<CertificationReport> {
   const profileIds = STATIC_PORTABILITY_POLICY.compatibility.requiredProfiles.map((profile) => profile.id);
   const [validation, security, compatibility] = await Promise.all([
     collectCertificationValidation(packageDir),
     scanPackageSecurity(packageDir),
     assessPackageCompatibility(packageDir, profileIds)
   ]);
-  const report = certifyPluginEvidence({ validation, security, compatibility });
-  const payload = { ok: report.status === "certified", command: "certify", version: CLI_VERSION, target: packageDir, ...report };
+  return certifyPluginEvidence({ validation, security, compatibility });
+}
+
+async function runCertifyRuntime(
+  args: string[],
+  cwd: string,
+  stdout: (message: string) => void,
+  stderr: (message: string) => void,
+  registryFactory?: CliIo["clientRuntimeAdapterRegistryFactory"]
+): Promise<number> {
+  const { target, json, options, client } = parseCertifyRuntimeArgs(args);
+  const resolved = resolve(cwd, target);
+  const info = await lstat(resolved).catch(() => undefined);
+  if (!info) throw new CliError(`Runtime certification target not found: ${target}`, "RUNTIME_CERTIFICATION_INPUT_ERROR");
+  if (info.isSymbolicLink() || (!info.isDirectory() && (!info.isFile() || basename(resolved) !== "plugin.json"))) {
+    throw new CliError("Runtime certification target must be a regular package directory or its regular plugin.json file", "RUNTIME_CERTIFICATION_INPUT_ERROR");
+  }
+  const packageDir = info.isDirectory() ? resolved : dirname(resolved);
+  const packageInfo = await lstat(packageDir).catch(() => undefined);
+  if (!packageInfo?.isDirectory() || packageInfo.isSymbolicLink()) {
+    throw new CliError("Runtime certification package root must be a regular directory", "RUNTIME_CERTIFICATION_INPUT_ERROR");
+  }
+
+  // Static evidence is deliberately collected and decided before any client
+  // adapter lifecycle is permitted to run.
+  const staticCertification = await collectStaticCertification(packageDir);
+  const staticPassed = staticCertification.status === "certified" && staticCertification.complete;
+  let clientRuntime: ClientRuntimeReport | undefined;
+  if (staticPassed) {
+    const createRegistry = registryFactory ?? ((factoryOptions) => createCliClientAdapterRegistry(
+      factoryOptions.executablePath,
+      factoryOptions.timeoutMs,
+      factoryOptions.allowMcpRuntime
+    ));
+    const clientTimeoutMs = options.timeoutMs ?? DEFAULT_CLIENT_RUNTIME_TIMEOUT_MS;
+    const adapters = createRegistry({
+      executablePath: client.executablePath,
+      timeoutMs: clientTimeoutMs,
+      allowMcpRuntime: client.allowMcpRuntime
+    });
+    let adapter;
+    try {
+      adapter = adapters.get(client.adapterId);
+    } catch (error) {
+      if (error instanceof UnknownClientRuntimeAdapterError) {
+        throw new CliError(error.message, "USAGE_ERROR", 2);
+      }
+      throw error;
+    }
+    if (adapter.metadata.synthetic) {
+      throw new CliError("certify-runtime requires a real non-synthetic client adapter", "USAGE_ERROR", 2);
+    }
+    clientRuntime = await runClientRuntimeHarness(packageDir, adapter, {
+      allowExecution: true,
+      grantedCapabilities: client.grantedCapabilities,
+      timeoutMs: clientTimeoutMs
+    });
+  }
+  const report = certifyRuntimeEvidence({ staticCertification, clientRuntime });
+  const payload = { ok: report.status === "certified", command: "certify-runtime", version: CLI_VERSION, target: packageDir, ...report };
   if (json) stdout(JSON.stringify(payload));
-  else renderCertification(payload, stdout, stderr);
+  else renderRuntimeCertification(payload, stdout, stderr);
   return payload.ok ? 0 : 1;
 }
 
@@ -500,7 +580,7 @@ function parseCompatArgs(args: string[]): { target: string; json: boolean; profi
   return { target, json, profileIds };
 }
 
-function parseCompatRuntimeArgs(args: string[]): {
+function parseCompatRuntimeArgs(args: string[], command = "compat-runtime"): {
   target: string;
   json: boolean;
   options: RuntimeCompatibilityOptions;
@@ -561,8 +641,8 @@ function parseCompatRuntimeArgs(args: string[]): {
       if (timeoutMs < 100 || timeoutMs > 30_000) throw new CliError("--timeout-ms requires an integer from 100 to 30000", "USAGE_ERROR", 2);
       continue;
     }
-    if (arg.startsWith("--")) throw new CliError(`Unknown compat-runtime option: ${arg}`, "USAGE_ERROR", 2);
-    if (seenTarget) throw new CliError("compat-runtime accepts only one target", "USAGE_ERROR", 2);
+    if (arg.startsWith("--")) throw new CliError(`Unknown ${command} option: ${arg}`, "USAGE_ERROR", 2);
+    if (seenTarget) throw new CliError(`${command} accepts only one target`, "USAGE_ERROR", 2);
     target = arg;
     seenTarget = true;
   }
@@ -621,9 +701,66 @@ function parseCompatRuntimeArgs(args: string[]): {
   return { target, json, options };
 }
 
+function parseCertifyRuntimeArgs(args: string[]): {
+  target: string;
+  json: boolean;
+  options: RuntimeCompatibilityOptions;
+  client: {
+    adapterId: typeof VSCODE_CLIENT_RUNTIME_ADAPTER_ID;
+    allowExecution: true;
+    allowMcpRuntime: true;
+    allowSyntheticFixture: false;
+    executablePath: string;
+    grantedCapabilities: ClientRuntimeCapability[];
+  };
+} {
+  const parsed = parseCompatRuntimeArgs(args, "certify-runtime");
+  const client = parsed.client;
+  if (!client) {
+    throw new CliError("certify-runtime requires --client-adapter with the real client adapter path", "USAGE_ERROR", 2);
+  }
+  if (client.adapterId !== VSCODE_CLIENT_RUNTIME_ADAPTER_ID) {
+    throw new CliError(`certify-runtime requires --client-adapter ${VSCODE_CLIENT_RUNTIME_ADAPTER_ID}`, "USAGE_ERROR", 2);
+  }
+  if (!client.allowExecution) {
+    throw new CliError("certify-runtime requires explicit --allow-client-runtime lifecycle consent", "USAGE_ERROR", 2);
+  }
+  if (!client.allowMcpRuntime) {
+    throw new CliError("certify-runtime requires explicit --allow-client-mcp-runtime consent", "USAGE_ERROR", 2);
+  }
+  if (client.allowSyntheticFixture) {
+    throw new CliError("--allow-synthetic-fixture is not valid for certify-runtime", "USAGE_ERROR", 2);
+  }
+  if (!client.executablePath) {
+    throw new CliError("certify-runtime requires --client-executable with an absolute executable path", "USAGE_ERROR", 2);
+  }
+  const expected = [...VSCODE_CLIENT_RUNTIME_REQUIRED_CAPABILITIES].sort();
+  const granted = [...client.grantedCapabilities].sort();
+  if (expected.length !== granted.length || expected.some((capability, index) => capability !== granted[index])) {
+    throw new CliError(
+      `certify-runtime requires exact capability grants: ${expected.join(", ")}`,
+      "USAGE_ERROR",
+      2
+    );
+  }
+  return {
+    target: parsed.target,
+    json: parsed.json,
+    options: parsed.options,
+    client: {
+      adapterId: VSCODE_CLIENT_RUNTIME_ADAPTER_ID,
+      allowExecution: true,
+      allowMcpRuntime: true,
+      allowSyntheticFixture: false,
+      executablePath: client.executablePath,
+      grantedCapabilities: granted
+    }
+  };
+}
+
 function createCliClientAdapterRegistry(
   executablePath?: string,
-  timeoutMs = 5_000,
+  timeoutMs = DEFAULT_CLIENT_RUNTIME_TIMEOUT_MS,
   allowMcpRuntime = false
 ): ClientRuntimeAdapterRegistry {
   return new ClientRuntimeAdapterRegistry([
@@ -671,7 +808,7 @@ function validateSourceSpecificFlags(sourceKind: SourceKind, flags: Set<string>)
 }
 
 function normalizeLegacyArgs(args: string[]): string[] {
-  if (["build", "validate", "scan", "compat", "compat-runtime", "certify"].includes(args[0]!)) return args;
+  if (["build", "validate", "scan", "compat", "compat-runtime", "certify", "certify-runtime"].includes(args[0]!)) return args;
   if (args[0]?.startsWith("--")) return ["build", ...args];
   if (args[0]) {
     const [input, maybeOut, ...rest] = args;
@@ -1005,6 +1142,32 @@ function renderCertification(
   write(`NOTE ${sanitizeConsoleText(payload.runtimeEvidence.note)}`);
 }
 
+function renderRuntimeCertification(
+  payload: RuntimeCertificationReport & { ok: boolean; target: string },
+  stdout: (message: string) => void,
+  stderr: (message: string) => void
+): void {
+  const write = payload.ok ? stdout : stderr;
+  write(`RUNTIME_CERTIFICATION_${payload.status.toUpperCase().replace("-", "_")} ${sanitizeConsoleText(payload.target)}`);
+  write(`RUNTIME_CERTIFICATION_POLICY ${payload.policy.id}@${payload.policy.version} complete=${payload.complete}`);
+  write(`RUNTIME_CERTIFICATION_SCOPE ${payload.scope}`);
+  write(`TARGET_CLIENT ${sanitizeConsoleText(payload.targetClient.id)}@${sanitizeConsoleText(payload.targetClient.version ?? "unknown")} name=${sanitizeConsoleText(payload.targetClient.name)}`);
+  write(`CLIENT_ADAPTER ${sanitizeConsoleText(payload.adapter.id)}@${sanitizeConsoleText(payload.adapter.version)} synthetic=${payload.adapter.synthetic}`);
+  write(`STATIC_CERTIFICATION ${payload.staticCertification.status} complete=${payload.staticCertification.complete}`);
+  write(`RUNTIME_EXECUTION status=${payload.execution.status} complete=${payload.execution.complete} finalize=${payload.execution.finalize}`);
+  write(`PACKAGE_INSTALL ${payload.packageInstall} required=false`);
+  write(`RUNTIME_OBSERVATIONS client-load=${payload.clientLoad} mcp-startup=${payload.mcpStartup} mcp-handshake=${payload.mcpHandshake} tool-exposure=${payload.toolExposure} tool-invocation=${payload.toolInvocation}`);
+  write(`INTEROPERABILITY ${payload.interoperability} scope=${payload.interoperabilityScope}`);
+  for (const check of payload.checks) {
+    write(`[${check.status.toUpperCase()}] ${check.id}@${check.version}: ${sanitizeConsoleText(check.title)}`);
+    for (const evidence of check.evidence) {
+      write(`  Evidence ${sanitizeConsoleText(evidence.location)}: ${sanitizeConsoleText(evidence.summary)}`);
+      if (evidence.remediation) write(`  Remediation: ${sanitizeConsoleText(evidence.remediation)}`);
+    }
+  }
+  write(`NOTE ${sanitizeConsoleText(payload.note)}`);
+}
+
 function renderFailure(
   error: unknown,
   json: boolean,
@@ -1065,6 +1228,7 @@ Usage:
   agentplugin compat [package-dir|plugin.json] [--profile <id>|--all] [--json]
   agentplugin compat-runtime [package-dir|plugin.json] [options]
   agentplugin certify [package-dir|plugin.json] [--json]
+  agentplugin certify-runtime [package-dir|plugin.json] [options]
   agentplugin --version
 
 Build options:
@@ -1115,6 +1279,16 @@ Certification:
   Aggregates official validation, fail-on-high security, and the three pinned Phase 2J
   compatibility profiles. Static certification does not prove runtime interoperability.
   --json                          Emit the deterministic certification report as JSON
+
+Runtime certification:
+  Runs static certification first, then only on success permits the real VS Code/GitHub
+  Copilot adapter to establish named-client-version-mcp-tool-path evidence. Requires
+  --client-adapter vscode-github-copilot, --client-executable, --allow-client-runtime,
+  --allow-client-mcp-runtime, and every exact --allow-client-* capability grant listed
+  above. Package installation is reported separately and is not required. Installation,
+  universal interoperability, other-client interoperability, and other-tool
+  interoperability are not implied.
+  --json                          Emit the bounded scoped runtime certification report as JSON
 
 Exit codes:
   0  Success

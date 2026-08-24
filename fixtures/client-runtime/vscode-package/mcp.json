@@ -4,6 +4,7 @@
     "phase3f-fixture": {
       "type": "stdio",
       "command": "node",
+      "cwd": "${PLUGIN_ROOT}",
       "args": [
         "vscode-mcp-server.mjs"
       ]

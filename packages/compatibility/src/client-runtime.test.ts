@@ -3,7 +3,9 @@ import {
   ClientRuntimeAdapterRegistry,
   KNOWN_CLIENT_RUNTIME_TARGETS,
   InvalidClientRuntimeAdapterError,
+  InvalidClientRuntimeReportError,
   UnknownClientRuntimeAdapterError,
+  parseClientRuntimeReport,
   runClientRuntimeHarness,
   type ClientRuntimeAdapter
 } from "./client-runtime.js";
@@ -163,6 +165,49 @@ describe("client runtime harness", () => {
     });
     expect(first.note).toContain("does not establish interoperability with any real client");
     expect(JSON.stringify(first)).toBe(JSON.stringify(second));
+  });
+
+  it("parses completed reports through the existing bounded runtime trust boundary", async () => {
+    const source = await runClientRuntimeHarness("package", createSyntheticFixtureClientAdapter(), { allowExecution: true });
+    expect(parseClientRuntimeReport(source)).toEqual(source);
+
+    const unsafe = structuredClone(source);
+    unsafe.evidence = [{
+      code: "APCI-CLIENT-TEST-001",
+      location: "location\nINJECTED",
+      summary: "token=literal-secret"
+    }];
+    const normalized = parseClientRuntimeReport(unsafe);
+    expect(JSON.stringify(normalized)).toContain("\\\\u000aINJECTED");
+    expect(JSON.stringify(normalized)).not.toContain("literal-secret");
+
+    expect(() => parseClientRuntimeReport({ ...source, schemaVersion: "future" }))
+      .toThrow(InvalidClientRuntimeReportError);
+    expect(() => parseClientRuntimeReport({ ...source, evidence: Array.from({ length: 9 }, () => source.evidence[0]) }))
+      .toThrow(InvalidClientRuntimeReportError);
+
+    const deniedAdapter = adapter("denied-parser", {
+      requiredCapabilities: ["client-process"],
+      finalize: () => {}
+    });
+    const denied = await runClientRuntimeHarness("package", deniedAdapter, {
+      allowExecution: false,
+      grantedCapabilities: ["client-process"]
+    });
+    expect(parseClientRuntimeReport(denied)).toEqual(denied);
+
+    const vscodeShaped = adapter("vscode-github-copilot", {
+      synthetic: false,
+      requiredCapabilities: ["package-read", "client-process", "client-filesystem", "network"],
+      finalize: () => {}
+    });
+    vscodeShaped.metadata.adapter.version = "1.5.0-test";
+    vscodeShaped.metadata.targetClient = { id: "vscode-github-copilot", name: "VS Code/GitHub Copilot" };
+    const withheld = await runClientRuntimeHarness("package", vscodeShaped, {
+      allowExecution: false,
+      grantedCapabilities: ["client-filesystem", "client-process", "network", "package-read"]
+    });
+    expect(parseClientRuntimeReport(withheld)).toEqual(withheld);
   });
 
   it("times out, aborts, and finalizes the fixture deterministically", async () => {

@@ -35,10 +35,10 @@ export const VSCODE_CLIENT_RUNTIME_REQUIRED_CAPABILITIES = Object.freeze([
   "network"
 ] as const);
 
-const ADAPTER_VERSION = "1.5.0";
+const ADAPTER_VERSION = "1.5.6";
 const MIN_OBSERVATION_MS = 100;
 const MAX_OBSERVATION_MS = 20_000;
-const DEFAULT_OBSERVATION_MS = 7_500;
+const DEFAULT_OBSERVATION_MS = 20_000;
 const VERSION_TIMEOUT_MS = 2_000;
 const TERMINATION_TIMEOUT_MS = 750;
 const TERMINATION_SETTLE_MS = 500;
@@ -55,6 +55,7 @@ const MAX_WINDOWS_LAUNCHER_BYTES = 8 * 1024;
 const MAX_WINDOWS_BUNDLED_CLI_BYTES = 16 * 1024 * 1024;
 const TEMP_PREFIX = "agentplugin-vscode-";
 const SHADOW_DIRECTORY = "client-shadow";
+const RUNTIME_PACKAGE_DIRECTORY = "runtime-package";
 const SHADOW_EXECUTABLE = "Code.exe";
 const OBSERVER_DIRECTORY = "agent-plugin-ci.agent-plugin-ci-runtime-observer-1.0.0";
 const OBSERVER_EXTENSION_ID = "agent-plugin-ci.agent-plugin-ci-runtime-observer";
@@ -101,7 +102,7 @@ function observerManifest(enableMcpObservation: boolean): string {
   engines: { vscode: "^1.100.0" },
   main: "./extension.js",
   activationEvents: ["*"],
-  ...(enableMcpObservation ? { enabledApiProposals: ["chatParticipantAdditions"] } : {})
+  ...(enableMcpObservation ? { enabledApiProposals: ["chatParticipantAdditions", "chatParticipantPrivate"] } : {})
 }, null, 2)}\n`;
 }
 
@@ -125,7 +126,7 @@ const MAX_TOOLS = ${MAX_OBSERVED_MCP_TOOLS};
 
 function matchingTools() {
   const McpSource = vscode.LanguageModelToolMCPSource;
-  if (typeof McpSource !== "function" || !Array.isArray(vscode.lm.tools)) return [];
+  if (typeof McpSource !== "function" || !vscode.lm || !Array.isArray(vscode.lm.tools)) return [];
   return vscode.lm.tools
     .filter((tool) => tool && typeof tool.name === "string"
       && tool.name.length > 0 && tool.name.length <= 240
@@ -154,14 +155,36 @@ async function activate(context) {
   const serverId = "plugin." + vscode.Uri.file(PACKAGE_ROOT).toString() + "." + EXPECTED_SERVER_LABEL;
   const before = new Set(matchingTools().map(toolIdentity));
   let tools = [];
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    await vscode.commands.executeCommand("workbench.mcp.startServer", serverId, {
-      waitForLiveTools: true,
+  let startCommandCompleted = false;
+  let pendingStartCommand;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const startCommand = vscode.commands.executeCommand("workbench.mcp.startServer", serverId, {
       autoTrustChanges: false
     });
+    const startOutcome = await Promise.race([
+      startCommand.then(() => "completed", () => "failed"),
+      new Promise((resolveDelay) => setTimeout(() => resolveDelay("pending"), 500))
+    ]);
+    if (startOutcome === "failed") break;
+    if (startOutcome === "pending") {
+      pendingStartCommand = startCommand;
+      break;
+    }
+    startCommandCompleted = true;
     tools = matchingTools();
     if (tools.length > 0) break;
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
+  }
+  if (pendingStartCommand) {
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      tools = matchingTools();
+      if (tools.length > 0) break;
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
+    }
+    startCommandCompleted = await Promise.race([
+      pendingStartCommand.then(() => true, () => false),
+      new Promise((resolveDelay) => setTimeout(() => resolveDelay(false), 1000))
+    ]);
   }
   const newlyExposedTools = tools.filter((tool) => !before.has(toolIdentity(tool)));
   const eligibleTools = tools.length === 1
@@ -192,7 +215,7 @@ async function activate(context) {
     expectedServerName: EXPECTED_SERVER_NAME,
     expectedToolName: EXPECTED_TOOL_NAME,
     serverId,
-    startCommandCompleted: true,
+    startCommandCompleted,
     matchingToolCount: tools.length,
     newlyExposedToolCount: newlyExposedTools.length,
     tools,
@@ -246,6 +269,10 @@ export interface VscodeClientRuntimeAdapterOptions {
 interface AdapterState {
   executablePath: string;
   packageRoot: string;
+  registeredPackageRoot: string;
+  runtimePackageRoot?: string;
+  runtimePackagePlugin?: string;
+  runtimePackageMcp?: string;
   tempBase: string;
   tempRoot: string;
   userDataDir: string;
@@ -382,9 +409,28 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
     if (mcpPreflight && !mcpPreflight.ok) {
       throw new Error("VS Code client-mediated MCP preflight rejected the package runtime target");
     }
-    const mcpTargetName = mcpPreflight?.ok ? mcpPreflight.target.name : undefined;
+    const mcpTarget = mcpPreflight?.ok ? mcpPreflight.target : undefined;
+    const mcpTargetName = mcpTarget?.name;
     const tempBase = resolve(this.#dependencies.tempDirectory());
     const tempRoot = await mkdtemp(join(tempBase, TEMP_PREFIX));
+    const runtimePackageRoot = mcpTarget ? join(tempRoot, RUNTIME_PACKAGE_DIRECTORY) : undefined;
+    const registeredPackageRoot = runtimePackageRoot ?? packageRoot;
+    const runtimePackagePlugin = mcpTarget
+      ? `${JSON.stringify(mcpTarget.pluginManifest, null, 2)}\n`
+      : undefined;
+    const runtimePackageMcp = mcpTarget
+      ? `${JSON.stringify({
+        $schema: mcpTarget.mcpSchema,
+        mcpServers: {
+          [mcpTarget.name]: {
+            type: "stdio",
+            command: mcpTarget.command,
+            cwd: packageRoot,
+            args: [...mcpTarget.args]
+          }
+        }
+      }, null, 2)}\n`
+      : undefined;
     const userDataDir = join(tempRoot, "user-data");
     const extensionsDir = join(tempRoot, "extensions");
     const observerRoot = join(extensionsDir, OBSERVER_DIRECTORY);
@@ -392,7 +438,7 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
     const observerMcpEvidence = join(observerRoot, OBSERVER_MCP_EVIDENCE_FILENAME);
     const expectedObserverManifest = mcpTargetName ? MCP_OBSERVER_MANIFEST : LOAD_ONLY_OBSERVER_MANIFEST;
     const expectedObserverSource = mcpTargetName
-      ? mcpObserverSource(packageRoot, mcpTargetName)
+      ? mcpObserverSource(registeredPackageRoot, mcpTargetName)
       : LOAD_ONLY_OBSERVER_SOURCE;
     const homeDir = join(tempRoot, "home");
     const observationFile = join(tempRoot, "observation.txt");
@@ -404,6 +450,10 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
     this.#state = {
       executablePath,
       packageRoot,
+      registeredPackageRoot,
+      ...(runtimePackageRoot ? { runtimePackageRoot } : {}),
+      ...(runtimePackagePlugin ? { runtimePackagePlugin } : {}),
+      ...(runtimePackageMcp ? { runtimePackageMcp } : {}),
       tempBase,
       tempRoot,
       userDataDir,
@@ -419,6 +469,14 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
       environment: isolatedEnvironment(this.#dependencies.environment, tempRoot, homeDir)
     };
     for (const directory of directories) await mkdir(directory, { recursive: true });
+    if (runtimePackageRoot && runtimePackagePlugin && runtimePackageMcp) {
+      await materializeRuntimePackage(
+        tempRoot,
+        runtimePackageRoot,
+        runtimePackagePlugin,
+        runtimePackageMcp
+      );
+    }
     await materializeObserver(
       tempRoot,
       extensionsDir,
@@ -429,7 +487,7 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
 
     const settings = {
       "chat.plugins.enabled": true,
-      "chat.pluginLocations": { [packageRoot]: true },
+      "chat.pluginLocations": { [registeredPackageRoot]: true },
       "chat.mcp.access": mcpTargetName ? "all" : "none",
       ...(mcpTargetName ? { "chat.mcp.autostart": "never" } : {}),
       "chat.plugins.marketplaces": [],
@@ -454,10 +512,17 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
       const versionObservation = await this.#readVersion(state, context.signal);
       if (!versionObservation) {
         const evidenceItems = [
+          ...(state.runtimePackageRoot ? [evidence(
+            "APCI-CLIENT-VSCODE-RUNTIME-MATERIALIZE-001",
+            "vscode/runtime-package",
+            "VS Code used a minimal isolated runtime representation whose MCP cwd was resolved by the trusted adapter to the canonical preflighted package root; the original package was not modified."
+          )] : []),
           evidence(
             "APCI-CLIENT-VSCODE-REGISTER-001",
             "vscode/local-registration",
-            "The package was registered through isolated chat.pluginLocations; local registration is not package installation."
+            state.runtimePackageRoot
+              ? "A minimal isolated runtime representation of the preflighted package was registered through chat.pluginLocations; this is not package installation."
+              : "The package was registered through isolated chat.pluginLocations; local registration is not package installation."
           ),
           evidence(
             "APCI-CLIENT-VSCODE-VERSION-002",
@@ -483,6 +548,7 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
         "--user-data-dir", state.userDataDir,
         "--extensions-dir", state.extensionsDir,
         "--extensionDevelopmentPath", state.observerRoot,
+        ...(state.mcpTargetName ? ["--enable-proposed-api", OBSERVER_EXTENSION_ID] : []),
         "--disable-telemetry",
         "--disable-updates",
         "--password-store=basic",
@@ -502,6 +568,14 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
         state.observerSource,
         true
       );
+      if (state.runtimePackageRoot && state.runtimePackagePlugin && state.runtimePackageMcp) {
+        await validateRuntimePackageMaterialization(
+          state.tempRoot,
+          state.runtimePackageRoot,
+          state.runtimePackagePlugin,
+          state.runtimePackageMcp
+        );
+      }
       const guiLauncher = await prepareWindowsShadowLauncher(
         this.#dependencies,
         state,
@@ -523,14 +597,21 @@ class VscodeClientRuntimeAdapter implements ClientRuntimeAdapter {
       launched.output();
       const observerActivated = await validateObserverMarker(state);
       const trustedClientLogs = await collectVscodeLogs(state.userDataDir);
-      const matches = observerActivated ? qualifyingLoadRecords(trustedClientLogs, state.packageRoot) : 0;
+      const matches = observerActivated ? qualifyingLoadRecords(trustedClientLogs, state.registeredPackageRoot) : 0;
       const observed = observerActivated && matches > 0;
       const clientLoad = !observerActivated ? "unknown" : observed ? "observed" : "not-observed";
       const evidenceItems = [
+          ...(state.runtimePackageRoot ? [evidence(
+            "APCI-CLIENT-VSCODE-RUNTIME-MATERIALIZE-001",
+            "vscode/runtime-package",
+            "VS Code used a minimal isolated runtime representation whose MCP cwd was resolved by the trusted adapter to the canonical preflighted package root; the original package was not modified."
+          )] : []),
           evidence(
             "APCI-CLIENT-VSCODE-REGISTER-001",
             "vscode/local-registration",
-            "The package was registered through isolated chat.pluginLocations; local registration is not package installation."
+            state.runtimePackageRoot
+              ? "A minimal isolated runtime representation of the preflighted package was registered through chat.pluginLocations; this is not package installation."
+              : "The package was registered through isolated chat.pluginLocations; local registration is not package installation."
           ),
           state.mcpTargetName
             ? evidence(
@@ -1199,6 +1280,70 @@ async function preflightPackageTree(canonicalRoot: string): Promise<void> {
   await visit(canonicalRoot, 0);
 }
 
+async function materializeRuntimePackage(
+  tempRoot: string,
+  runtimePackageRoot: string,
+  expectedPlugin: string,
+  expectedMcp: string
+): Promise<void> {
+  if (runtimePackageRoot !== join(tempRoot, RUNTIME_PACKAGE_DIRECTORY)) {
+    throw new Error("VS Code runtime package path escaped isolated client state");
+  }
+  await mkdir(runtimePackageRoot);
+  await writeFile(join(runtimePackageRoot, "plugin.json"), expectedPlugin, { encoding: "utf8", flag: "wx" });
+  await writeFile(join(runtimePackageRoot, "mcp.json"), expectedMcp, { encoding: "utf8", flag: "wx" });
+  await validateRuntimePackageMaterialization(tempRoot, runtimePackageRoot, expectedPlugin, expectedMcp);
+}
+
+async function validateRuntimePackageMaterialization(
+  tempRoot: string,
+  runtimePackageRoot: string,
+  expectedPlugin: string,
+  expectedMcp: string
+): Promise<void> {
+  if (runtimePackageRoot !== join(tempRoot, RUNTIME_PACKAGE_DIRECTORY)) {
+    throw new Error("VS Code runtime package path did not match its fixed isolated location");
+  }
+  const tempInfo = await lstat(tempRoot);
+  const runtimeInfo = await lstat(runtimePackageRoot);
+  if (!tempInfo.isDirectory() || tempInfo.isSymbolicLink()
+    || !runtimeInfo.isDirectory() || runtimeInfo.isSymbolicLink()) {
+    throw new Error("VS Code runtime package path contained an unsafe filesystem entry");
+  }
+  const canonicalTempRoot = await realpath(tempRoot);
+  const canonicalRuntimeRoot = await realpath(runtimePackageRoot);
+  if (!isWithin(canonicalTempRoot, canonicalRuntimeRoot) || canonicalRuntimeRoot === canonicalTempRoot) {
+    throw new Error("VS Code runtime package escaped isolated client state");
+  }
+  const entries: string[] = [];
+  const directory = await opendir(canonicalRuntimeRoot);
+  for await (const entry of directory) {
+    entries.push(entry.name);
+    if (entries.length > 2 || entry.isSymbolicLink() || !entry.isFile()) {
+      throw new Error("VS Code runtime package contained an unexpected filesystem entry");
+    }
+  }
+  entries.sort();
+  if (entries.join("\n") !== "mcp.json\nplugin.json") {
+    throw new Error("VS Code runtime package contents did not match its minimal trusted definition");
+  }
+  const pluginPath = await validateContainedRegularFile(
+    canonicalRuntimeRoot, ["plugin.json"], Buffer.byteLength(expectedPlugin)
+  );
+  const mcpPath = await validateContainedRegularFile(
+    canonicalRuntimeRoot, ["mcp.json"], Buffer.byteLength(expectedMcp)
+  );
+  const plugin = await readBoundedTrustedFile(
+    pluginPath, canonicalRuntimeRoot, Buffer.byteLength(expectedPlugin)
+  );
+  const mcp = await readBoundedTrustedFile(
+    mcpPath, canonicalRuntimeRoot, Buffer.byteLength(expectedMcp)
+  );
+  if (plugin !== expectedPlugin || mcp !== expectedMcp) {
+    throw new Error("VS Code runtime package content changed after trusted materialization");
+  }
+}
+
 async function materializeObserver(
   tempRoot: string,
   extensionsDir: string,
@@ -1424,7 +1569,7 @@ async function validateMcpObserverEvidence(state: AdapterState): Promise<{
     || parsed.expectedServerName !== EXPECTED_MCP_SERVER_NAME
     || parsed.expectedToolName !== EXPECTED_MCP_TOOL_NAME
     || typeof parsed.serverId !== "string"
-    || !validExpectedMcpServerId(parsed.serverId, state.packageRoot, state.mcpTargetName)
+    || !validExpectedMcpServerId(parsed.serverId, state.registeredPackageRoot, state.mcpTargetName)
     || parsed.startCommandCompleted !== true
     || !Number.isInteger(parsed.matchingToolCount)
     || !Number.isInteger(parsed.newlyExposedToolCount)

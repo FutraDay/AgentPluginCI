@@ -2,7 +2,7 @@
 
 Agent Plugin CI builds and validates portable Agent Plugins from real integration sources.
 
-> **v0.1 Developer Preview** — MCP ingestion, OpenAPI ingestion, deterministic `PluginIR` normalization, Agent Plugins 1.0 compilation, validation, security scanning, static compatibility testing, static certification, and a distribution-ready CLI.
+> **v0.1 Developer Preview** — MCP ingestion, OpenAPI ingestion, deterministic `PluginIR` normalization, Agent Plugins 1.0 compilation, validation, security scanning, static compatibility testing, static certification, scoped real-client runtime certification, and a distribution-ready CLI.
 
 The core architecture is intentionally fixed:
 
@@ -129,9 +129,22 @@ The built-in policy pins the Phase 2J portable-core, Cursor, and VS Code/GitHub 
 
 Certification is static evidence only: `runtimeVerified` is always `false`, while client installation and MCP handshake remain `not-assessed`. A static certificate does not prove runtime interoperability.
 
+Scoped runtime certification is a separate, explicitly executable command. It first requires the same successful static certificate, then uses the real VS Code/GitHub Copilot adapter with exact capability grants and both lifecycle and client-MCP opt-ins:
+
+```powershell
+node apps/cli/dist/index.cjs certify-runtime dist/support-api `
+  --client-adapter vscode-github-copilot `
+  --client-executable 'C:\Path\To\Code.exe' `
+  --allow-client-runtime --allow-client-mcp-runtime `
+  --allow-client-package-read --allow-client-process `
+  --allow-client-filesystem --allow-client-network --json
+```
+
+A positive result is limited to `named-client-version-mcp-tool-path`. `packageInstall` is reported separately and `not-observed` is non-blocking; installation, universal interoperability, other clients, and other tools are not implied. CI tests use an injected trusted adapter and do not require VS Code to be installed.
+
 ## Machine-readable CI output
 
-Add `--json` to `build`, `validate`, `scan`, `compat`, or `certify` to emit one JSON object on stdout.
+Add `--json` to `build`, `validate`, `scan`, `compat`, `compat-runtime`, `certify`, or `certify-runtime` to emit one JSON object on stdout.
 
 ```powershell
 node apps/cli/dist/index.cjs build --openapi fixtures/openapi/search.json --name search-api --out dist/search-api --json

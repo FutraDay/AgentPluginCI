@@ -140,6 +140,12 @@ export class InvalidClientRuntimeAdapterError extends Error {
   }
 }
 
+export class InvalidClientRuntimeReportError extends Error {
+  constructor() {
+    super("Client runtime report is malformed or outside safety bounds");
+  }
+}
+
 export class UnknownClientRuntimeAdapterError extends Error {
   constructor(readonly adapterId: string) {
     super(`Unknown client runtime adapter: ${safeText(adapterId)}`);
@@ -175,6 +181,106 @@ export class ClientRuntimeAdapterRegistry {
 }
 
 class ClientRuntimeTimeoutError extends Error {}
+
+/**
+ * Parses a completed client-runtime report at the same trust boundary used for
+ * adapter output. The returned report is a deterministic, bounded copy and no
+ * untrusted exception detail is retained.
+ */
+export function parseClientRuntimeReport(raw: unknown): ClientRuntimeReport {
+  try {
+    if (!isRecord(raw)
+      || raw.schemaVersion !== CLIENT_RUNTIME_REPORT_SCHEMA_VERSION
+      || raw.evidenceLevel !== CLIENT_RUNTIME_EVIDENCE_LEVEL
+      || raw.scope !== CLIENT_RUNTIME_SCOPE
+      || typeof raw.synthetic !== "boolean"
+      || !isRecord(raw.adapter)
+      || !isRecord(raw.targetClient)
+      || !isRecord(raw.execution)) throw new Error();
+
+    const adapter = {
+      id: requiredSafeId(raw.adapter.id),
+      version: requiredSafeVersion(raw.adapter.version)
+    };
+    const targetClient = {
+      id: requiredSafeId(raw.targetClient.id),
+      name: requiredSafeLabel(raw.targetClient.name),
+      ...(raw.targetClient.version === undefined
+        ? {}
+        : { version: requiredSafeVersion(raw.targetClient.version) })
+    };
+    const requestedCapabilities = normalizeCapabilities(
+      raw.requestedCapabilities as readonly ClientRuntimeCapability[],
+      "requested capabilities"
+    );
+    const grantedCapabilities = normalizeCapabilities(
+      raw.grantedCapabilities as readonly ClientRuntimeCapability[],
+      "granted capabilities"
+    );
+    const status = raw.execution.status;
+    const complete = raw.execution.complete;
+    const finalize = raw.execution.finalize;
+    if (!isExecutionStatus(status) || typeof complete !== "boolean" || !isFinalizeStatus(finalize)) throw new Error();
+    if (complete && finalize !== "complete") throw new Error();
+
+    const packageInstall = requiredObservation(raw.packageInstall);
+    const clientLoad = requiredObservation(raw.clientLoad);
+    const mcpStartup = requiredObservation(raw.mcpStartup);
+    const mcpHandshake = requiredObservation(raw.mcpHandshake);
+    const toolExposure = requiredObservation(raw.toolExposure);
+    const toolInvocation = requiredObservation(raw.toolInvocation);
+    const interoperability = raw.interoperability;
+    const interoperabilityScope = raw.interoperabilityScope;
+    if ((interoperability !== "scoped-established" && interoperability !== "not-established")
+      || (interoperabilityScope !== "named-client-version-mcp-tool-path" && interoperabilityScope !== "none")) throw new Error();
+    if (!Array.isArray(raw.evidence) || raw.evidence.length > MAX_EVIDENCE_ITEMS) throw new Error();
+    const evidenceItems = boundedEvidence(raw.evidence.map(normalizeEvidence));
+    if (typeof raw.note !== "string" || raw.note.length === 0) throw new Error();
+
+    const scopedEvidenceIsConsistent = raw.synthetic === false
+      && status === "pass"
+      && complete
+      && finalize === "complete"
+      && concreteClientVersion(targetClient.version)
+      && clientLoad === "observed"
+      && mcpStartup === "observed"
+      && mcpHandshake === "observed"
+      && toolExposure === "observed"
+      && toolInvocation === "observed"
+      && evidenceItems.length > 0
+      && requestedCapabilities.length === grantedCapabilities.length
+      && requestedCapabilities.every((capability, index) => grantedCapabilities[index] === capability);
+    if (interoperability === "scoped-established") {
+      if (interoperabilityScope !== "named-client-version-mcp-tool-path" || !scopedEvidenceIsConsistent) throw new Error();
+    } else if (interoperabilityScope !== "none") {
+      throw new Error();
+    }
+
+    return {
+      schemaVersion: CLIENT_RUNTIME_REPORT_SCHEMA_VERSION,
+      evidenceLevel: CLIENT_RUNTIME_EVIDENCE_LEVEL,
+      scope: CLIENT_RUNTIME_SCOPE,
+      synthetic: raw.synthetic,
+      adapter,
+      targetClient,
+      requestedCapabilities,
+      grantedCapabilities,
+      execution: { status, complete, finalize },
+      packageInstall,
+      clientLoad,
+      mcpStartup,
+      mcpHandshake,
+      toolExposure,
+      toolInvocation,
+      interoperability,
+      interoperabilityScope,
+      evidence: evidenceItems,
+      note: safeText(raw.note)
+    };
+  } catch {
+    throw new InvalidClientRuntimeReportError();
+  }
+}
 
 export async function runClientRuntimeHarness(
   packageRoot: string,
@@ -337,7 +443,7 @@ function normalizeAdapterOutput(raw: unknown): ClientRuntimeAdapterOutput {
       || !isObservation(raw.mcpStartup) || !isObservation(raw.mcpHandshake)
       || !isObservation(raw.toolExposure) || !isObservation(raw.toolInvocation)) throw new Error();
     if (raw.interoperability !== "scoped-established" && raw.interoperability !== "not-established") throw new Error();
-    if (raw.targetClientVersion !== undefined && !safeVersion(raw.targetClientVersion)) throw new Error();
+    if (raw.targetClientVersion !== undefined && !concreteClientVersion(raw.targetClientVersion)) throw new Error();
     if (!Array.isArray(raw.evidence) || raw.evidence.length > MAX_EVIDENCE_INPUT_ITEMS) throw new Error();
     const items = raw.evidence.map(normalizeEvidence);
     return {
@@ -374,7 +480,7 @@ function warrantsScopedInteroperability(
     && output?.interoperability === "scoped-established"
     && output.status === "pass"
     && complete
-    && output.targetClientVersion !== undefined
+    && concreteClientVersion(output.targetClientVersion)
     && output.clientLoad === "observed"
     && output.mcpStartup === "observed"
     && output.mcpHandshake === "observed"
@@ -555,12 +661,44 @@ function safeVersion(value: unknown): value is string {
   return validVersion(value) && safeText(value) === value;
 }
 
+function concreteClientVersion(value: unknown): value is string {
+  return safeVersion(value) && /\d/.test(value);
+}
+
 function validLabel(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 128 && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
+function requiredSafeId(value: unknown): string {
+  if (!validId(value) || safeText(value) !== value) throw new Error();
+  return value;
+}
+
+function requiredSafeVersion(value: unknown): string {
+  if (!safeVersion(value)) throw new Error();
+  return value;
+}
+
+function requiredSafeLabel(value: unknown): string {
+  if (!validLabel(value) || safeText(value) !== value) throw new Error();
+  return value;
+}
+
+function requiredObservation(value: unknown): ClientRuntimeObservationStatus {
+  if (!isObservation(value)) throw new Error();
+  return value;
+}
+
 function isExecutionResult(value: unknown): value is ClientRuntimeAdapterOutput["status"] {
   return value === "pass" || value === "fail" || value === "unknown";
+}
+
+function isExecutionStatus(value: unknown): value is ClientRuntimeExecutionStatus {
+  return isExecutionResult(value) || value === "timeout" || value === "denied";
+}
+
+function isFinalizeStatus(value: unknown): value is ClientRuntimeFinalizeStatus {
+  return value === "complete" || value === "failed" || value === "timeout" || value === "not-run";
 }
 
 function isObservation(value: unknown): value is ClientRuntimeObservationStatus {

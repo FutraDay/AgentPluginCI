@@ -1,6 +1,6 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { lstatSync, mkdirSync, readlinkSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -32,7 +32,7 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
   it("declares the real target and all conservative opt-in capabilities", () => {
     const adapter = createVscodeClientRuntimeAdapter({ executablePath: process.execPath });
     expect(adapter.metadata).toEqual({
-      adapter: { id: "vscode-github-copilot", version: "1.5.0" },
+      adapter: { id: "vscode-github-copilot", version: "1.5.6" },
       targetClient: { id: "vscode-github-copilot", name: "VS Code/GitHub Copilot" },
       synthetic: false,
       requiredCapabilities: ["package-read", "client-process", "client-filesystem", "network"]
@@ -115,12 +115,38 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
     const settings = JSON.parse(await fake.settingsReads[0]!) as Record<string, unknown>;
     expect(settings["chat.mcp.access"]).toBe("all");
     expect(settings["chat.mcp.autostart"]).toBe("never");
+    const registeredLocations = Object.keys(settings["chat.pluginLocations"] as Record<string, unknown>);
+    expect(registeredLocations).toHaveLength(1);
+    expect(registeredLocations[0]).not.toBe(packageRoot);
+    const runtimePlugin = JSON.parse(await fake.runtimePluginReads[0]!) as Record<string, unknown>;
+    const runtimeMcp = JSON.parse(await fake.runtimeMcpReads[0]!) as {
+      mcpServers: Record<string, { command: string; cwd: string; args: string[] }>;
+    };
+    expect(runtimePlugin).toMatchObject({ name: "vscode-fixture" });
+    expect(runtimeMcp.mcpServers[serverName]).toEqual({
+      type: "stdio",
+      command: "node",
+      cwd: packageRoot,
+      args: ["fixture-server.mjs"]
+    });
+    expect(report.evidence.map((item) => item.code)).toContain("APCI-CLIENT-VSCODE-RUNTIME-MATERIALIZE-001");
     const observerManifest = JSON.parse(await fake.observerManifestReads[0]!) as Record<string, unknown>;
-    expect(observerManifest.enabledApiProposals).toEqual(["chatParticipantAdditions"]);
+    expect(observerManifest.enabledApiProposals).toEqual(["chatParticipantAdditions", "chatParticipantPrivate"]);
+    const mainInvocation = fake.invocations.find((item) => item.args.includes("--wait"))!;
+    const proposalIndex = mainInvocation.args.indexOf("--enable-proposed-api");
+    expect(proposalIndex).toBeGreaterThan(-1);
+    expect(mainInvocation.args[proposalIndex + 1]).toBe("agent-plugin-ci.agent-plugin-ci-runtime-observer");
+    expect(mainInvocation.args.filter((arg) => arg === "--enable-proposed-api")).toHaveLength(1);
     const observerSource = await fake.observerSourceReads[0]!;
     expect(observerSource).toContain('executeCommand("workbench.mcp.startServer", serverId');
-    expect(observerSource).toContain("LanguageModelToolMCPSource");
-    expect(observerSource).toContain("waitForLiveTools: true");
+    expect(observerSource).toContain("const McpSource = vscode.LanguageModelToolMCPSource;");
+    expect(observerSource).toContain('typeof McpSource !== "function" || !vscode.lm || !Array.isArray(vscode.lm.tools)');
+    expect(observerSource).toContain("tool.source instanceof McpSource");
+    expect(observerSource).not.toContain("waitForLiveTools");
+    expect(observerSource).toContain("const startOutcome = await Promise.race([");
+    expect(observerSource).toContain("pendingStartCommand = startCommand;");
+    expect(observerSource).toContain("startCommandCompleted,");
+    expect(observerSource).toContain("autoTrustChanges: false");
     expect(observerSource).toContain("vscode.lm.invokeTool(eligibleTools[0].name, {");
     expect(observerSource).toContain("toolInvocationToken: undefined");
     expect(observerSource).toContain(EXPECTED_VSCODE_MCP_TOOL_ID);
@@ -337,7 +363,7 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
     });
 
     expect(report).toMatchObject({
-      adapter: { version: "1.5.0" },
+      adapter: { version: "1.5.6" },
       targetClient: { version: "1.118.0" },
       execution: { status: "pass", complete: true, finalize: "complete" },
       packageInstall: "not-observed",
@@ -681,6 +707,7 @@ describe("VS Code/GitHub Copilot client runtime adapter", () => {
     expect(vscodeInvocations).toHaveLength(2);
     expect(vscodeInvocations[0]!.args).toContain("--version");
     expect(vscodeInvocations[1]!.args).toContain("--wait");
+    expect(vscodeInvocations[1]!.args).not.toContain("--enable-proposed-api");
     const logIndex = vscodeInvocations[1]!.args.indexOf("--log");
     expect(vscodeInvocations[1]!.args[logIndex + 1]).toBe("trace");
     for (const invocation of fake.invocations) {
@@ -1352,6 +1379,8 @@ function fakeRuntime(
   observerManifestReads: Array<Promise<string>>;
   observerRegistryReads: Array<Promise<string>>;
   observerSourceReads: Array<Promise<string>>;
+  runtimePluginReads: Array<Promise<string>>;
+  runtimeMcpReads: Array<Promise<string>>;
   terminatedPids: number[];
   logLinkErrors: unknown[];
 } {
@@ -1360,6 +1389,8 @@ function fakeRuntime(
   const observerManifestReads: Array<Promise<string>> = [];
   const observerRegistryReads: Array<Promise<string>> = [];
   const observerSourceReads: Array<Promise<string>> = [];
+  const runtimePluginReads: Array<Promise<string>> = [];
+  const runtimeMcpReads: Array<Promise<string>> = [];
   const children = new Map<number, FakeChild>();
   const terminatedPids: number[] = [];
   const logLinkErrors: unknown[] = [];
@@ -1413,7 +1444,15 @@ function fakeRuntime(
         const extensionsIndex = args.indexOf("--extensions-dir");
         const extensionsDir = args[extensionsIndex + 1]!;
         const observerRoot = join(extensionsDir, OBSERVER_DIRECTORY);
-        settingsReads.push(readFile(join(userDataDir, "User", "settings.json"), "utf8"));
+        const settingsPath = join(userDataDir, "User", "settings.json");
+        const currentSettings = JSON.parse(readFileSync(settingsPath, "utf8")) as Record<string, unknown>;
+        const locations = currentSettings["chat.pluginLocations"] as Record<string, unknown>;
+        const registeredPackageRoot = Object.keys(locations)[0] ?? packageRoot;
+        settingsReads.push(readFile(settingsPath, "utf8"));
+        if (registeredPackageRoot !== packageRoot) {
+          runtimePluginReads.push(readFile(join(registeredPackageRoot, "plugin.json"), "utf8"));
+          runtimeMcpReads.push(readFile(join(registeredPackageRoot, "mcp.json"), "utf8"));
+        }
         observerManifestReads.push(readFile(join(observerRoot, "package.json"), "utf8"));
         observerRegistryReads.push(readFile(join(extensionsDir, "extensions.json"), "utf8"));
         observerSourceReads.push(readFile(join(observerRoot, "extension.js"), "utf8"));
@@ -1425,16 +1464,22 @@ function fakeRuntime(
           );
         }
         if (options.mcpEvidence !== undefined) {
+          let mcpEvidence = options.mcpEvidence;
+          if (typeof mcpEvidence !== "string" && mcpEvidence && typeof mcpEvidence === "object" && !Array.isArray(mcpEvidence)) {
+            const normalizedEvidence = { ...(mcpEvidence as Record<string, unknown>) };
+            if (typeof normalizedEvidence.expectedServerLabel === "string") {
+              normalizedEvidence.serverId = `plugin.${pathToFileURL(registeredPackageRoot).href}.${normalizedEvidence.expectedServerLabel}`;
+            }
+            mcpEvidence = normalizedEvidence;
+          }
           writeFileSync(
             join(observerRoot, OBSERVER_MCP_EVIDENCE_FILENAME),
-            typeof options.mcpEvidence === "string"
-              ? options.mcpEvidence
-              : JSON.stringify(options.mcpEvidence),
+            typeof mcpEvidence === "string" ? mcpEvidence : JSON.stringify(mcpEvidence),
             "utf8"
           );
         }
         const logOutput = options.logOutput === undefined
-          ? `[File Watcher (universal)] Request to start watching: ${packageRoot} (excludes: <none>)`
+          ? `[File Watcher (universal)] Request to start watching: ${registeredPackageRoot} (excludes: <none>)`
           : options.logOutput;
         if (logOutput !== null) {
           const logDirectory = join(userDataDir, "logs", "fixture-session");
@@ -1455,7 +1500,7 @@ function fakeRuntime(
           }
         }
         queueMicrotask(() => child.stderr.write(options.clientOutput ??
-          `Agent plugin watcher discovered ${join(packageRoot, "plugin.json")}`));
+          `Agent plugin watcher discovered ${join(registeredPackageRoot, "plugin.json")}`));
       }
       return child as never;
     },
@@ -1472,6 +1517,8 @@ function fakeRuntime(
     observerManifestReads,
     observerRegistryReads,
     observerSourceReads,
+    runtimePluginReads,
+    runtimeMcpReads,
     terminatedPids,
     logLinkErrors
   };
@@ -1491,7 +1538,8 @@ async function createPackage(options: { mcpServerName?: string } = {}): Promise<
         [options.mcpServerName]: {
           type: "stdio",
           command: "node",
-          args: [join(root, "fixture-server.mjs")]
+          cwd: "${PLUGIN_ROOT}",
+          args: ["fixture-server.mjs"]
         }
       }
     });

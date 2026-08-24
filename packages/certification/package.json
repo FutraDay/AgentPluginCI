@@ -1,7 +1,7 @@
 {
   "name": "@agent-plugin-ci/certification",
   "version": "0.1.0",
-  "description": "Deterministic static certification aggregation for Agent Plugin CI evidence.",
+  "description": "Deterministic static and scoped real-client runtime certification for Agent Plugin CI evidence.",
   "private": true,
   "type": "module",
   "exports": "./src/index.ts",

@@ -1,7 +1,7 @@
 {
   "name": "@agent-plugin-ci/cli",
   "version": "0.1.0",
-  "description": "Build, validate, scan, compatibility-test, and certify portable Agent Plugins from MCP, OpenAPI, or PluginIR sources.",
+  "description": "Build, validate, scan, compatibility-test, and statically or runtime-certify portable Agent Plugins from MCP, OpenAPI, or PluginIR sources.",
   "private": false,
   "type": "module",
   "bin": { "agentplugin": "dist/index.cjs" },

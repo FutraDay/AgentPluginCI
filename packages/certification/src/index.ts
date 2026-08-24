@@ -1,8 +1,17 @@
 import {
+  CLIENT_RUNTIME_REPORT_SCHEMA_VERSION,
   COMPATIBILITY_REPORT_SCHEMA_VERSION,
   COPILOT_PROFILE_ID,
   CURSOR_PROFILE_ID,
   PORTABLE_CORE_PROFILE_ID,
+  parseClientRuntimeReport,
+  type ClientRuntimeCapability,
+  type ClientRuntimeEvidence,
+  type ClientRuntimeExecutionStatus,
+  type ClientRuntimeFinalizeStatus,
+  type ClientRuntimeInteroperability,
+  type ClientRuntimeInteroperabilityScope,
+  type ClientRuntimeObservationStatus,
   type CompatibilityProfileReport,
   type CompatibilitySuiteReport
 } from "@agent-plugin-ci/compatibility";
@@ -143,6 +152,449 @@ export function certifyPluginEvidence(input: CertificationEvidenceInput): Certif
 }
 
 export const certifyPlugin = certifyPluginEvidence;
+
+export const RUNTIME_CERTIFICATION_REPORT_SCHEMA_VERSION = "1.0.0";
+export const SCOPED_RUNTIME_CERTIFICATION_ID = "APCI-CERT-RUNTIME-NAMED-CLIENT-MCP-TOOL";
+export const SCOPED_RUNTIME_CERTIFICATION_VERSION = "1.0.0";
+export const SCOPED_RUNTIME_CERTIFICATION_POLICY_ID = "APCI-POLICY-RUNTIME-NAMED-CLIENT-MCP-TOOL";
+export const SCOPED_RUNTIME_CERTIFICATION_POLICY_VERSION = "1.0.0";
+export const SCOPED_RUNTIME_CERTIFICATION_SCOPE = "named-client-version-mcp-tool-path" as const;
+export const RUNTIME_CERTIFICATION_CHECK_VERSION = "1.0.0";
+
+export const RUNTIME_CERTIFICATION_CHECK_IDS = Object.freeze({
+  staticCertification: "APCI-CERT-RUNTIME-STATIC-001",
+  clientRuntime: "APCI-CERT-RUNTIME-EVIDENCE-001"
+} as const);
+
+export interface ScopedRuntimeCertificationPolicy {
+  id: typeof SCOPED_RUNTIME_CERTIFICATION_POLICY_ID;
+  version: typeof SCOPED_RUNTIME_CERTIFICATION_POLICY_VERSION;
+  title: string;
+  scope: typeof SCOPED_RUNTIME_CERTIFICATION_SCOPE;
+  staticCertification: {
+    schemaVersion: typeof CERTIFICATION_REPORT_SCHEMA_VERSION;
+    certificationId: typeof STATIC_PORTABILITY_CERTIFICATION_ID;
+    certificationVersion: typeof STATIC_PORTABILITY_CERTIFICATION_VERSION;
+    requiredStatus: "certified";
+    complete: true;
+  };
+  clientRuntime: {
+    schemaVersion: typeof CLIENT_RUNTIME_REPORT_SCHEMA_VERSION;
+    synthetic: false;
+    executionStatus: "pass";
+    executionComplete: true;
+    finalize: "complete";
+    concreteTargetClientVersion: true;
+    interoperability: "scoped-established";
+    interoperabilityScope: typeof SCOPED_RUNTIME_CERTIFICATION_SCOPE;
+    requiredObservations: readonly ["clientLoad", "mcpStartup", "mcpHandshake", "toolExposure", "toolInvocation"];
+    exactCapabilityGrants: true;
+    boundedEvidence: true;
+    packageInstall: "reported-non-blocking";
+  };
+}
+
+export const SCOPED_RUNTIME_CERTIFICATION_POLICY: Readonly<ScopedRuntimeCertificationPolicy> = Object.freeze({
+  id: SCOPED_RUNTIME_CERTIFICATION_POLICY_ID,
+  version: SCOPED_RUNTIME_CERTIFICATION_POLICY_VERSION,
+  title: "Named client version MCP tool-path runtime certification",
+  scope: SCOPED_RUNTIME_CERTIFICATION_SCOPE,
+  staticCertification: Object.freeze({
+    schemaVersion: CERTIFICATION_REPORT_SCHEMA_VERSION,
+    certificationId: STATIC_PORTABILITY_CERTIFICATION_ID,
+    certificationVersion: STATIC_PORTABILITY_CERTIFICATION_VERSION,
+    requiredStatus: "certified",
+    complete: true
+  }),
+  clientRuntime: Object.freeze({
+    schemaVersion: CLIENT_RUNTIME_REPORT_SCHEMA_VERSION,
+    synthetic: false,
+    executionStatus: "pass",
+    executionComplete: true,
+    finalize: "complete",
+    concreteTargetClientVersion: true,
+    interoperability: "scoped-established",
+    interoperabilityScope: SCOPED_RUNTIME_CERTIFICATION_SCOPE,
+    requiredObservations: Object.freeze(["clientLoad", "mcpStartup", "mcpHandshake", "toolExposure", "toolInvocation"] as const),
+    exactCapabilityGrants: true,
+    boundedEvidence: true,
+    packageInstall: "reported-non-blocking"
+  })
+});
+
+export interface RuntimeCertificationEvidenceInput {
+  staticCertification: unknown;
+  clientRuntime?: unknown;
+}
+
+export interface RuntimeCertificationCheckResult {
+  id: (typeof RUNTIME_CERTIFICATION_CHECK_IDS)[keyof typeof RUNTIME_CERTIFICATION_CHECK_IDS];
+  version: typeof RUNTIME_CERTIFICATION_CHECK_VERSION;
+  title: string;
+  status: CertificationCheckStatus;
+  evidenceCount: { observed: number; included: number; omitted: number; capped: boolean };
+  evidence: CertificationEvidence[];
+}
+
+export interface RuntimeCertificationReport {
+  schemaVersion: typeof RUNTIME_CERTIFICATION_REPORT_SCHEMA_VERSION;
+  certification: {
+    id: typeof SCOPED_RUNTIME_CERTIFICATION_ID;
+    version: typeof SCOPED_RUNTIME_CERTIFICATION_VERSION;
+    title: string;
+  };
+  policy: Readonly<ScopedRuntimeCertificationPolicy>;
+  status: CertificationStatus;
+  complete: boolean;
+  scope: typeof SCOPED_RUNTIME_CERTIFICATION_SCOPE | "none";
+  summary: { pass: number; fail: number; unknown: number; total: number };
+  checks: RuntimeCertificationCheckResult[];
+  staticCertification: {
+    schemaVersion: string;
+    id: string;
+    version: string;
+    status: CertificationStatus | "invalid";
+    complete: boolean;
+  };
+  clientRuntimeSchemaVersion: string;
+  adapter: { id: string; version: string; synthetic: boolean | "unknown" };
+  targetClient: { id: string; name: string; version?: string };
+  requestedCapabilities: ClientRuntimeCapability[];
+  grantedCapabilities: ClientRuntimeCapability[];
+  execution: { status: ClientRuntimeExecutionStatus | "invalid"; complete: boolean; finalize: ClientRuntimeFinalizeStatus | "invalid" };
+  packageInstall: ClientRuntimeObservationStatus;
+  clientLoad: ClientRuntimeObservationStatus;
+  mcpStartup: ClientRuntimeObservationStatus;
+  mcpHandshake: ClientRuntimeObservationStatus;
+  toolExposure: ClientRuntimeObservationStatus;
+  toolInvocation: ClientRuntimeObservationStatus;
+  interoperability: ClientRuntimeInteroperability | "invalid";
+  interoperabilityScope: ClientRuntimeInteroperabilityScope | "invalid";
+  runtimeEvidence: ClientRuntimeEvidence[];
+  note: string;
+}
+
+export type ScopedRuntimeCertificationReport = RuntimeCertificationReport;
+
+export const RUNTIME_CERTIFICATION_NON_UNIVERSAL_CLAIM_NOTE = "Certification is limited to the named client version and observed MCP tool path. Installation of the package is independent and is not certified or implied. Universal interoperability, other-client interoperability, and other-tool interoperability are not implied.";
+
+export function certifyRuntimeEvidence(input: RuntimeCertificationEvidenceInput): RuntimeCertificationReport {
+  const staticResult = evaluateStaticCertification(readField(input, "staticCertification"));
+  const runtimeResult = evaluateClientRuntime(readField(input, "clientRuntime"));
+  const checks = [staticResult.check, runtimeResult.check];
+  const status: CertificationStatus = checks.some((candidate) => candidate.status === "fail")
+    ? "not-certified"
+    : checks.some((candidate) => candidate.status === "unknown") ? "unknown" : "certified";
+  const summary = {
+    pass: checks.filter((candidate) => candidate.status === "pass").length,
+    fail: checks.filter((candidate) => candidate.status === "fail").length,
+    unknown: checks.filter((candidate) => candidate.status === "unknown").length,
+    total: checks.length
+  };
+
+  return {
+    schemaVersion: RUNTIME_CERTIFICATION_REPORT_SCHEMA_VERSION,
+    certification: {
+      id: SCOPED_RUNTIME_CERTIFICATION_ID,
+      version: SCOPED_RUNTIME_CERTIFICATION_VERSION,
+      title: SCOPED_RUNTIME_CERTIFICATION_POLICY.title
+    },
+    policy: SCOPED_RUNTIME_CERTIFICATION_POLICY,
+    status,
+    complete: summary.unknown === 0,
+    scope: status === "certified" ? SCOPED_RUNTIME_CERTIFICATION_SCOPE : "none",
+    summary,
+    checks,
+    staticCertification: staticResult.snapshot,
+    ...runtimeResult.snapshot,
+    note: RUNTIME_CERTIFICATION_NON_UNIVERSAL_CLAIM_NOTE
+  };
+}
+
+export const certifyScopedRuntimeEvidence = certifyRuntimeEvidence;
+export const certifyRuntime = certifyRuntimeEvidence;
+
+function evaluateStaticCertification(raw: unknown): {
+  check: RuntimeCertificationCheckResult;
+  snapshot: RuntimeCertificationReport["staticCertification"];
+} {
+  const schemaVersion = safeString(readField(raw, "schemaVersion"));
+  const certification = readField(raw, "certification");
+  const id = safeString(readField(certification, "id"));
+  const version = safeString(readField(certification, "version"));
+  const rawStatus = readField(raw, "status");
+  const rawComplete = readField(raw, "complete");
+  const status = rawStatus === "certified" || rawStatus === "not-certified" || rawStatus === "unknown"
+    ? rawStatus : "invalid";
+  const structurallyCurrent = validCurrentStaticCertification(raw);
+  const checkStatus: CertificationCheckStatus = structurallyCurrent && status === "not-certified"
+    ? "fail"
+    : structurallyCurrent && status === "certified" && rawComplete === true ? "pass" : "unknown";
+  const candidates: CertificationEvidence[] = [{
+    location: "static-certification",
+    summary: checkStatus === "pass"
+      ? "The current static portability certification is complete and certified."
+      : checkStatus === "fail"
+        ? "The static portability certification is not certified."
+        : "A complete successful current static portability certificate was not provided.",
+    ...(checkStatus === "pass" ? {} : { remediation: "Complete current static certification successfully before runtime certification." })
+  }];
+  return {
+    check: runtimeCheck(RUNTIME_CERTIFICATION_CHECK_IDS.staticCertification, "Current static portability certification", checkStatus, candidates),
+    snapshot: {
+      schemaVersion: safeText(schemaVersion || "invalid"),
+      id: safeText(id || "invalid"),
+      version: safeText(version || "invalid"),
+      status,
+      complete: rawComplete === true
+    }
+  };
+}
+
+function validCurrentStaticCertification(raw: unknown): boolean {
+  if (!isRecord(raw)
+    || raw.schemaVersion !== CERTIFICATION_REPORT_SCHEMA_VERSION
+    || !isRecord(raw.certification)
+    || raw.certification.id !== STATIC_PORTABILITY_CERTIFICATION_ID
+    || raw.certification.version !== STATIC_PORTABILITY_CERTIFICATION_VERSION
+    || !isRecord(raw.policy)
+    || raw.policy.id !== STATIC_PORTABILITY_CERTIFICATION_ID
+    || raw.policy.version !== STATIC_PORTABILITY_CERTIFICATION_VERSION
+    || !isRecord(raw.policy.validation)
+    || raw.policy.validation.errors !== "fail"
+    || raw.policy.validation.warnings !== "non-blocking"
+    || !isRecord(raw.policy.security)
+    || raw.policy.security.failOn !== "high"
+    || raw.policy.security.incomplete !== "unknown"
+    || !isRecord(raw.policy.compatibility)
+    || !sameRequiredCompatibilityProfiles(raw.policy.compatibility.requiredProfiles)
+    || !Array.isArray(raw.checks)
+    || raw.checks.length !== Object.keys(CERTIFICATION_CHECK_IDS).length
+    || !isRecord(raw.summary)
+    || !isRecord(raw.runtimeEvidence)
+    || raw.runtimeEvidence.runtimeVerified !== false) return false;
+  const expected = Object.values(CERTIFICATION_CHECK_IDS).sort(compareText);
+  const statuses: CertificationCheckStatus[] = [];
+  const actual = raw.checks.map((candidate) => {
+    if (!isRecord(candidate)
+      || candidate.version !== CERTIFICATION_CHECK_VERSION
+      || (candidate.status !== "pass" && candidate.status !== "fail" && candidate.status !== "unknown")
+      || typeof candidate.id !== "string") return "";
+    statuses.push(candidate.status);
+    return candidate.id;
+  }).sort(compareText);
+  if (!actual.every((candidate, index) => candidate === expected[index])) return false;
+  const derivedStatus: CertificationStatus = statuses.includes("fail")
+    ? "not-certified"
+    : statuses.includes("unknown") ? "unknown" : "certified";
+  const pass = statuses.filter((candidate) => candidate === "pass").length;
+  const fail = statuses.filter((candidate) => candidate === "fail").length;
+  const unknown = statuses.filter((candidate) => candidate === "unknown").length;
+  return raw.status === derivedStatus
+    && raw.complete === (unknown === 0)
+    && raw.summary.pass === pass
+    && raw.summary.fail === fail
+    && raw.summary.unknown === unknown
+    && raw.summary.total === statuses.length;
+}
+
+function sameRequiredCompatibilityProfiles(raw: unknown): boolean {
+  if (!Array.isArray(raw) || raw.length !== REQUIRED_COMPATIBILITY_PROFILES.length) return false;
+  return raw.every((candidate, index) => isRecord(candidate)
+    && candidate.id === REQUIRED_COMPATIBILITY_PROFILES[index]?.id
+    && candidate.version === REQUIRED_COMPATIBILITY_PROFILES[index]?.version);
+}
+
+function evaluateClientRuntime(raw: unknown): {
+  check: RuntimeCertificationCheckResult;
+  snapshot: Omit<RuntimeCertificationReport,
+    "schemaVersion" | "certification" | "policy" | "status" | "complete" | "scope" | "summary" | "checks" | "staticCertification" | "note">;
+} {
+  if (raw === undefined) {
+    return {
+      check: runtimeCheck(
+        RUNTIME_CERTIFICATION_CHECK_IDS.clientRuntime,
+        "Bounded real-client MCP tool-path evidence",
+        "unknown",
+        [{
+          location: "client-runtime",
+          summary: "No client runtime report was collected, so no scoped runtime claim can be made."
+        }],
+        0
+      ),
+      snapshot: emptyRuntimeSnapshot("not-assessed")
+    };
+  }
+  let report;
+  try {
+    report = parseClientRuntimeReport(raw);
+  } catch {
+    return {
+      check: runtimeCheck(
+        RUNTIME_CERTIFICATION_CHECK_IDS.clientRuntime,
+        "Bounded real-client MCP tool-path evidence",
+        "unknown",
+        [{
+          location: "client-runtime",
+          summary: "Client runtime evidence was malformed, incomplete, stale, or outside processing bounds.",
+          remediation: "Generate a complete current ClientRuntimeReport with the official client harness."
+        }]
+      ),
+      snapshot: emptyRuntimeSnapshot()
+    };
+  }
+
+  const evidenceClaimSafe = runtimeEvidenceIsClaimSafe(raw);
+
+  const exactCapabilities = report.requestedCapabilities.length === report.grantedCapabilities.length
+    && report.requestedCapabilities.every((capability, index) => report.grantedCapabilities[index] === capability);
+  const observations = [report.clientLoad, report.mcpStartup, report.mcpHandshake, report.toolExposure, report.toolInvocation];
+  const positive = report.synthetic === false
+    && report.execution.status === "pass"
+    && report.execution.complete
+    && report.execution.finalize === "complete"
+    && report.targetClient.version !== undefined
+    && report.interoperability === "scoped-established"
+    && report.interoperabilityScope === SCOPED_RUNTIME_CERTIFICATION_SCOPE
+    && observations.every((observation) => observation === "observed")
+    && exactCapabilities
+    && report.evidence.length > 0
+    && evidenceClaimSafe;
+  const definiteFailure = report.synthetic
+    || report.execution.status === "fail"
+    || report.execution.status === "timeout"
+    || report.execution.status === "denied"
+    || report.interoperability === "not-established"
+    || observations.some((observation) => observation === "not-observed")
+    || !exactCapabilities;
+  const checkStatus: CertificationCheckStatus = positive ? "pass" : !evidenceClaimSafe ? "unknown" : definiteFailure ? "fail" : "unknown";
+  const candidates = !evidenceClaimSafe
+    ? [{
+        location: "client-runtime/evidence",
+        summary: "Runtime evidence required redaction, control escaping, truncation, or exceeded certification claim bounds and was rejected for claim promotion.",
+        remediation: "Generate fresh bounded evidence without credentials, control characters, or oversized fields."
+      }]
+    : runtimeRequirementEvidence(report, exactCapabilities, checkStatus);
+  return {
+    check: runtimeCheck(
+      RUNTIME_CERTIFICATION_CHECK_IDS.clientRuntime,
+      "Bounded real-client MCP tool-path evidence",
+      checkStatus,
+      candidates,
+      Math.max(report.evidence.length, candidates.length)
+    ),
+    snapshot: {
+      clientRuntimeSchemaVersion: report.schemaVersion,
+      adapter: { ...report.adapter, synthetic: report.synthetic },
+      targetClient: { ...report.targetClient },
+      requestedCapabilities: [...report.requestedCapabilities],
+      grantedCapabilities: [...report.grantedCapabilities],
+      execution: { ...report.execution },
+      packageInstall: report.packageInstall,
+      clientLoad: report.clientLoad,
+      mcpStartup: report.mcpStartup,
+      mcpHandshake: report.mcpHandshake,
+      toolExposure: report.toolExposure,
+      toolInvocation: report.toolInvocation,
+      interoperability: report.interoperability,
+      interoperabilityScope: report.interoperabilityScope,
+      runtimeEvidence: report.evidence.map((item) => ({ ...item }))
+    }
+  };
+}
+
+function runtimeEvidenceIsClaimSafe(raw: unknown): boolean {
+  try {
+    const items = readField(raw, "evidence");
+    if (!Array.isArray(items) || items.length === 0 || items.length > MAX_EVIDENCE_ITEMS) return false;
+    return items.every((candidate) => {
+      const code = readField(candidate, "code");
+      const location = readField(candidate, "location");
+      const summary = readField(candidate, "summary");
+      const remediation = readField(candidate, "remediation");
+      if (typeof code !== "string" || !/^APCI-[A-Z0-9-]{3,80}$/.test(code)
+        || typeof location !== "string" || typeof summary !== "string"
+        || (remediation !== undefined && typeof remediation !== "string")) return false;
+      const text = remediation === undefined ? [location, summary] : [location, summary, remediation];
+      return text.every((value) => value.length > 0
+        && value.length <= MAX_TEXT_LENGTH
+        && !/[\u0000-\u001f\u007f]/.test(value)
+        && redactSensitiveText(value) === value);
+    });
+  } catch {
+    return false;
+  }
+}
+
+function runtimeRequirementEvidence(
+  report: ReturnType<typeof parseClientRuntimeReport>,
+  exactCapabilities: boolean,
+  status: CertificationCheckStatus
+): CertificationEvidence[] {
+  if (status === "pass") {
+    return [{
+      location: `client-runtime/${report.targetClient.id}@${report.targetClient.version}`,
+      summary: "A real adapter produced complete scoped interoperability evidence for the named client version and MCP tool path. Package installation is reported separately and is non-blocking."
+    }];
+  }
+  const candidates: CertificationEvidence[] = [];
+  const add = (condition: boolean, location: string, summary: string) => {
+    if (!condition) candidates.push({ location, summary, remediation: "Generate fresh complete evidence with the official real-client harness and all exact capability grants." });
+  };
+  add(!report.synthetic, "client-runtime/adapter", "Synthetic adapter evidence can never receive scoped runtime certification.");
+  add(report.execution.status === "pass" && report.execution.complete, "client-runtime/execution", "Client execution must pass and be complete.");
+  add(report.execution.finalize === "complete", "client-runtime/finalize", "Client finalization must complete.");
+  add(report.targetClient.version !== undefined, "client-runtime/target-client", "A concrete target client version is required.");
+  add(report.interoperability === "scoped-established", "client-runtime/interoperability", "Scoped interoperability must be established.");
+  add(report.interoperabilityScope === SCOPED_RUNTIME_CERTIFICATION_SCOPE, "client-runtime/interoperability-scope", "Interoperability scope must be the named client version MCP tool path.");
+  for (const [name, observation] of ([
+    ["client-load", report.clientLoad],
+    ["mcp-startup", report.mcpStartup],
+    ["mcp-handshake", report.mcpHandshake],
+    ["tool-exposure", report.toolExposure],
+    ["tool-invocation", report.toolInvocation]
+  ] as const)) add(observation === "observed", `client-runtime/${name}`, `${name} must be observed.`);
+  add(exactCapabilities, "client-runtime/capabilities", "Granted capabilities must exactly match the adapter request.");
+  add(report.evidence.length > 0, "client-runtime/evidence", "Bounded runtime evidence is required.");
+  return candidates.length > 0 ? candidates : [{
+    location: "client-runtime",
+    summary: "Runtime evidence did not establish every scoped certification requirement.",
+    remediation: "Generate fresh complete evidence with the official real-client harness."
+  }];
+}
+
+function emptyRuntimeSnapshot(
+  observation: ClientRuntimeObservationStatus = "unknown"
+): ReturnType<typeof evaluateClientRuntime>["snapshot"] {
+  return {
+    clientRuntimeSchemaVersion: "invalid",
+    adapter: { id: "unknown", version: "unknown", synthetic: "unknown" },
+    targetClient: { id: "unknown", name: "Unknown client" },
+    requestedCapabilities: [],
+    grantedCapabilities: [],
+    execution: { status: "invalid", complete: false, finalize: "invalid" },
+    packageInstall: observation,
+    clientLoad: observation,
+    mcpStartup: observation,
+    mcpHandshake: observation,
+    toolExposure: observation,
+    toolInvocation: observation,
+    interoperability: "invalid",
+    interoperabilityScope: "invalid",
+    runtimeEvidence: []
+  };
+}
+
+function runtimeCheck(
+  id: RuntimeCertificationCheckResult["id"],
+  title: string,
+  status: CertificationCheckStatus,
+  evidence: CertificationEvidence[],
+  observed = evidence.length
+): RuntimeCertificationCheckResult {
+  const normalized = check(id as CertificationCheckResult["id"], title, status, evidence, observed);
+  return { ...normalized, id, version: RUNTIME_CERTIFICATION_CHECK_VERSION };
+}
 
 function validationCheck(validation: ValidationResult): CertificationCheckResult {
   const errors = normalizedStrings(readField(validation, "errors"));

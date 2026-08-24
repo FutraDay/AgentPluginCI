@@ -78,6 +78,10 @@ export interface RuntimeCompatibilityOptions {
 export interface ClientMcpStdioTarget {
   name: string;
   location: string;
+  command: string;
+  args: readonly string[];
+  pluginManifest: Readonly<Record<string, unknown>>;
+  mcpSchema: string;
 }
 
 export type ClientMcpStdioPreflight =
@@ -165,7 +169,8 @@ export async function preflightSingleClientMcpStdioTarget(
 
   const command = boundedString(raw.command, MAX_COMMAND);
   const args = boundedStringArray(raw.args, MAX_ARGS, MAX_STRING);
-  if (!command || args === undefined || raw.cwd !== undefined) {
+  const cwdIsAllowed = raw.cwd === undefined || raw.cwd === "${PLUGIN_ROOT}";
+  if (!command || args === undefined || !cwdIsAllowed) {
     return clientPreflightFailure(
       "APCI-RUNTIME-BOUND-003",
       location,
@@ -189,7 +194,25 @@ export async function preflightSingleClientMcpStdioTarget(
     );
   }
 
-  return { ok: true, target: { name: rawName, location } };
+  const mcpSchema = boundedString(mcpRead.value.$schema, MAX_STRING);
+  if (!mcpSchema) {
+    return clientPreflightFailure(
+      "APCI-RUNTIME-BOUND-005",
+      "mcp.json/$schema",
+      "MCP schema metadata is outside client-mediated runtime safety bounds."
+    );
+  }
+  return {
+    ok: true,
+    target: {
+      name: rawName,
+      location,
+      command,
+      args: Object.freeze([...args]),
+      pluginManifest: pluginRead.value,
+      mcpSchema
+    }
+  };
 }
 
 async function clientMcpArgsStayContained(canonicalRoot: string, args: readonly string[]): Promise<boolean> {
