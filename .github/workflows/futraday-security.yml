@@ -31,7 +31,7 @@ jobs:
           tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
           sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
       - name: Scan current tree for secrets
-        run: gitleaks dir --source . --redact --no-banner
+        run: gitleaks dir --redact --no-banner .
 
   trivy:
     name: Trivy critical vulnerabilities and misconfigurations
