@@ -101,7 +101,7 @@ describe("compatibility profiles and reports", () => {
               : index === 1
                 ? "-----BEGIN PRIVATE KEY-----\nprivate-material"
                 : index === 2
-                  ? "AWS key AKIAABCDEFGHIJKLMNOP"
+                  ? "AWS key AKIAABCDEFGHIJKLMNOP" // gitleaks:allow
               : `evidence-${index}`
           }))
         })
@@ -117,7 +117,7 @@ describe("compatibility profiles and reports", () => {
     expect(report.tests[0]?.evidence[0]?.summary).not.toContain("\n");
     expect(serialized).toContain("[REDACTED]");
     expect(serialized).not.toContain("PRIVATE KEY");
-    expect(serialized).not.toContain("AKIAABCDEFGHIJKLMNOP");
+    expect(serialized).not.toContain("AKIAABCDEFGHIJKLMNOP"); // gitleaks:allow
   });
 
   it("fails closed when assessment input is explicitly incomplete", () => {
