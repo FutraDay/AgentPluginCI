@@ -6,7 +6,7 @@
   "exports": "./src/index.ts",
   "dependencies": {
     "@agent-plugin-ci/plugin-ir": "workspace:*",
-    "@modelcontextprotocol/client": "2.0.0"
+    "@modelcontextprotocol/client": "2.3.0"
   },
   "devDependencies": {
     "@agent-plugin-ci/compiler": "workspace:*",
