@@ -11,7 +11,7 @@
   "devDependencies": {
     "@agent-plugin-ci/compiler": "workspace:*",
     "@agent-plugin-ci/validator": "workspace:*",
-    "@modelcontextprotocol/server": "2.0.0"
+    "@modelcontextprotocol/server": "2.3.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json --noEmit",
